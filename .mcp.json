@@ -1,0 +1,6 @@
+{
+  "orchestrator": {
+    "command": "node",
+    "args": ["E:/PROJETS/mcp-orchestrator/dist/server.js"]
+  }
+}
