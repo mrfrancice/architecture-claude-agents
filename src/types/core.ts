@@ -115,3 +115,68 @@ export interface Result<T, E = Error> {
 }
 
 export type AsyncResult<T, E = Error> = Promise<Result<T, E>>;
+
+// ============================================================================
+// AGENT DISPATCH TYPES
+// ============================================================================
+
+export type DispatchMode = 'manual' | 'cli';
+
+export interface AgentDefinition {
+    id: AgentId;
+    name: string;
+    description: string;
+    systemPrompt: string;
+    capabilities: string[];
+    model?: string;
+    builtIn: boolean;
+}
+
+export interface AgentContext {
+    agent: AgentDefinition;
+    task: string;
+    phase: {
+        id: PhaseId;
+        name: string;
+        description: string;
+        iteration: number;
+        maxIterations: number;
+        feedback: string[];
+    };
+    previousPhases: PreviousPhaseInfo[];
+    memories: Record<string, string>;
+    projectInfo: ProjectInfo;
+}
+
+export interface PreviousPhaseInfo {
+    phaseId: PhaseId;
+    phaseName: string;
+    status: PhaseStatus;
+    score: number | null;
+    agentOutputs: Record<AgentId, string>;
+}
+
+export interface DispatchResult {
+    agentId: AgentId;
+    mode: DispatchMode;
+    status: 'SUCCESS' | 'PARTIAL' | 'FAILED';
+    output: string;
+    duration: number;
+    error?: string;
+}
+
+export interface ManualDispatchPrompt {
+    agentId: AgentId;
+    agentName: string;
+    systemPrompt: string;
+    userPrompt: string;
+    model?: string;
+}
+
+export interface PhaseDispatchResult {
+    phaseId: PhaseId;
+    phaseName: string;
+    mode: DispatchMode;
+    results: DispatchResult[];
+    prompts?: ManualDispatchPrompt[];
+}

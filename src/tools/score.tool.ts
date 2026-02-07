@@ -17,14 +17,16 @@ Breakdown du score (total 100%):
 - Documentation (5%): Présence de docs
 
 Bonuses:
-- High coverage (>90%): +5
-- No lint errors: +3
-- Documentation complete: +2
+- High test coverage (>90%): +5
+- No lint errors (best practices ≥95%): +3
+- Documentation complete (≥90%): +2
+- Zero security issues: +2
 
 Penalties:
-- Lint errors: -2 par erreur
-- No tests: -10
-- Low coverage (<50%): -5`,
+- No/minimal tests (score <30%): -10
+- Low test coverage (score <50%): -5
+- Many lint errors (best practices <50%): -5
+- Security vulnerabilities (score <60%): -10`,
     inputSchema: {
         type: 'object',
         properties: {
