@@ -9,7 +9,7 @@ export type TaskId = string;
 export type AgentId = string;
 export type SnapshotId = string;
 
-export type WorkflowType = 'BUILD' | 'REVIEW' | 'OPTIMIZE' | 'DESIGN' | 'DEBUG' | 'SECURITY_AUDIT';
+export type WorkflowType = 'BUILD' | 'REVIEW' | 'OPTIMIZE' | 'DESIGN' | 'DEBUG' | 'SECURITY_AUDIT' | 'CUSTOM';
 export type WorkflowStatus = 'PENDING' | 'RUNNING' | 'PAUSED' | 'COMPLETE' | 'FAILED' | 'CANCELLED';
 export type PhaseStatus = 'PENDING' | 'RUNNING' | 'PASS' | 'ITERATE' | 'FAIL' | 'SKIPPED';
 
@@ -144,6 +144,7 @@ export interface AgentContext {
         feedback: string[];
     };
     previousPhases: PreviousPhaseInfo[];
+    peerOutputs: Record<AgentId, string>;
     memories: Record<string, string>;
     projectInfo: ProjectInfo;
 }
@@ -162,7 +163,19 @@ export interface DispatchResult {
     status: 'SUCCESS' | 'PARTIAL' | 'FAILED';
     output: string;
     duration: number;
+    retryCount?: number;
     error?: string;
+}
+
+export interface CustomWorkflowTemplate {
+    name: string;
+    description: string;
+    phases: Array<{
+        name: string;
+        description?: string;
+        agents: AgentId[];
+        maxIterations?: number;
+    }>;
 }
 
 export interface ManualDispatchPrompt {

@@ -6,13 +6,16 @@
   "scripts": {
     "build": "tsc",
     "start": "node dist/server.js",
-    "dev": "tsc --watch"
+    "dev": "tsc --watch",
+    "test": "vitest run",
+    "test:watch": "vitest"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.25.3"
   },
   "devDependencies": {
     "@types/node": "^25.2.1",
-    "typescript": "^5.7.0"
+    "typescript": "^5.7.0",
+    "vitest": "^4.0.18"
   }
 }

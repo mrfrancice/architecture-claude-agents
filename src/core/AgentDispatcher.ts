@@ -51,6 +51,7 @@ export class ContextPipeline {
         workflow: Workflow,
         phase: WorkflowPhase,
         feedback: string[],
+        peerOutputs: Record<AgentId, string> = {},
     ): Promise<AgentContext> {
         const agent = this.registry.getRequired(agentId);
 
@@ -72,6 +73,7 @@ export class ContextPipeline {
                 feedback,
             },
             previousPhases,
+            peerOutputs,
             memories,
             projectInfo: workflow.context.projectInfo,
         };
@@ -107,6 +109,16 @@ export class ContextPipeline {
                     const truncated = output.length > 2000 ? output.slice(0, 2000) + '\n... [truncated]' : output;
                     parts.push(`\n**Agent ${aid}:**\n${truncated}`);
                 }
+            }
+        }
+
+        // Outputs des agents precedents dans cette phase
+        const peerEntries = Object.entries(context.peerOutputs);
+        if (peerEntries.length > 0) {
+            parts.push('\n## Other Agents Output (same phase)');
+            for (const [aid, output] of peerEntries) {
+                const truncated = output.length > 3000 ? output.slice(0, 3000) + '\n... [truncated]' : output;
+                parts.push(`\n### Agent ${aid}:\n${truncated}`);
             }
         }
 
@@ -195,7 +207,8 @@ export class AgentDispatcher {
     }
 
     /**
-     * Dispatch tous les agents d'une phase sequentiellement
+     * Dispatch tous les agents d'une phase sequentiellement.
+     * Chaque agent recoit les outputs des agents precedents dans la meme phase.
      */
     async dispatchPhase(
         workflow: Workflow,
@@ -213,13 +226,19 @@ export class AgentDispatcher {
 
         const results: DispatchResult[] = [];
         const prompts: ManualDispatchPrompt[] = [];
+        const peerOutputs: Record<AgentId, string> = {};
 
         for (const agentId of agentIds) {
-            const context = await this.pipeline.buildContext(agentId, workflow, phase, feedback);
+            const context = await this.pipeline.buildContext(agentId, workflow, phase, feedback, peerOutputs);
 
             if (this.mode === 'cli') {
-                const result = await this.dispatchCli(context);
+                const result = await this.dispatchCliWithRetry(context);
                 results.push(result);
+
+                // Accumuler l'output pour les agents suivants
+                if (result.status !== 'FAILED' && result.output) {
+                    peerOutputs[agentId] = result.output;
+                }
 
                 await this.eventBus.emit('agent:dispatched', {
                     workflowId: workflow.id,
@@ -231,7 +250,6 @@ export class AgentDispatcher {
                 const prompt = this.buildManualPrompt(context);
                 prompts.push(prompt);
 
-                // En mode manual, on cree un DispatchResult "en attente"
                 const result: DispatchResult = {
                     agentId,
                     mode: 'manual',
@@ -274,8 +292,9 @@ export class AgentDispatcher {
         workflow: Workflow,
         phase: WorkflowPhase,
         feedback: string[] = [],
+        peerOutputs: Record<AgentId, string> = {},
     ): Promise<ManualDispatchPrompt> {
-        const context = await this.pipeline.buildContext(agentId, workflow, phase, feedback);
+        const context = await this.pipeline.buildContext(agentId, workflow, phase, feedback, peerOutputs);
         return this.buildManualPrompt(context);
     }
 
@@ -314,6 +333,47 @@ export class AgentDispatcher {
     // ========================================================================
     // PRIVATE
     // ========================================================================
+
+    private static readonly MAX_RETRIES = 3;
+    private static readonly RETRY_DELAYS = [1000, 2000, 4000]; // exponential backoff
+
+    private async dispatchCliWithRetry(context: AgentContext): Promise<DispatchResult> {
+        let lastError = '';
+        const startTime = Date.now();
+
+        for (let attempt = 0; attempt <= AgentDispatcher.MAX_RETRIES; attempt++) {
+            const result = await this.dispatchCli(context);
+
+            if (result.status !== 'FAILED') {
+                result.retryCount = attempt;
+                result.duration = Date.now() - startTime;
+                return result;
+            }
+
+            lastError = result.error || 'Unknown error';
+
+            // Ne pas retry si c'est une erreur de contenu (pas transitoire)
+            if (lastError.includes('not found') || lastError.includes('invalid')) {
+                result.retryCount = attempt;
+                return result;
+            }
+
+            if (attempt < AgentDispatcher.MAX_RETRIES) {
+                const delay = AgentDispatcher.RETRY_DELAYS[attempt] || 4000;
+                await new Promise(resolve => setTimeout(resolve, delay));
+            }
+        }
+
+        return {
+            agentId: context.agent.id,
+            mode: 'cli',
+            status: 'FAILED',
+            output: '',
+            duration: Date.now() - startTime,
+            retryCount: AgentDispatcher.MAX_RETRIES,
+            error: `Failed after ${AgentDispatcher.MAX_RETRIES + 1} attempts. Last error: ${lastError}`,
+        };
+    }
 
     private async dispatchCli(context: AgentContext): Promise<DispatchResult> {
         const startTime = Date.now();

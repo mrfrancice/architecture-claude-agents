@@ -1,25 +1,34 @@
 /**
- * rollback.tool - Outil MCP pour gérer les rollbacks
+ * rollback.tool - Outil MCP pour gerer les snapshots et rollbacks
  */
 
 import type { Tool } from '@modelcontextprotocol/sdk/types.js';
 
 export const rollbackTool: Tool = {
     name: 'orchestrator_rollback',
-    description: `Effectue un rollback vers un snapshot précédent.
+    description: `Gere les snapshots Git et les rollbacks.
 
-Le système de snapshots permet de:
-- Créer des points de restauration avant chaque phase
-- Revenir à un état précédent en cas d'échec
-- Préserver l'historique des modifications
+Actions disponibles :
+- **restore** (defaut) : Restaure un snapshot. Si aucun snapshotId, utilise le dernier.
+- **list** : Liste tous les snapshots disponibles.
+- **create** : Cree un snapshot manuel (description optionnelle).
 
-Si aucun snapshotId n'est fourni, utilise le dernier snapshot valide.`,
+Le systeme cree automatiquement des snapshots avant chaque phase.`,
     inputSchema: {
         type: 'object',
         properties: {
+            action: {
+                type: 'string',
+                enum: ['restore', 'list', 'create'],
+                description: 'Action a effectuer (defaut: restore)',
+            },
             snapshotId: {
                 type: 'string',
-                description: 'ID du snapshot vers lequel rollback (optionnel)',
+                description: 'ID du snapshot vers lequel rollback (pour "restore")',
+            },
+            description: {
+                type: 'string',
+                description: 'Description du snapshot (pour "create")',
             },
         },
     },

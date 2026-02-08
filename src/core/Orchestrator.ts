@@ -8,6 +8,8 @@
  *   MemoryManager, SnapshotManager, ScoringEngine
  */
 
+import { readdir, readFile } from 'node:fs/promises';
+import { join } from 'node:path';
 import type {
     Workflow,
     WorkflowType,
@@ -18,6 +20,8 @@ import type {
     DispatchMode,
     PhaseDispatchResult,
     ManualDispatchPrompt,
+    CustomWorkflowTemplate,
+    AgentDefinition,
 } from '../types/core.js';
 import { EventBus, getEventBus } from './EventBus.js';
 import { StateManager, type OrchestratorStats } from './StateManager.js';
@@ -95,6 +99,7 @@ export class Orchestrator {
     private agentDispatcher: AgentDispatcher | null = null;
     private dispatchMode: DispatchMode = 'manual';
     private lastDispatchResult: PhaseDispatchResult | null = null;
+    private customWorkflows = new Map<string, CustomWorkflowTemplate>();
 
     constructor(projectRoot?: string) {
         this.projectRoot = projectRoot || process.cwd();
@@ -132,6 +137,9 @@ export class Orchestrator {
             this.dispatchMode,
         );
 
+        // Charger les workflows custom
+        await this.loadCustomWorkflows();
+
         // Charger la config projet
         this.projectConfig = await this.configLoader.load();
 
@@ -163,7 +171,7 @@ export class Orchestrator {
     /**
      * Démarre un nouveau workflow
      */
-    async startWorkflow(type: WorkflowType, task: string): Promise<Result<Workflow>> {
+    async startWorkflow(type: WorkflowType, task: string, customName?: string): Promise<Result<Workflow>> {
         this.ensureInitialized();
 
         if (this.currentWorkflow && this.currentWorkflow.status === 'RUNNING') {
@@ -174,7 +182,20 @@ export class Orchestrator {
         }
 
         const workflowId = `wf_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
-        const phases = this.createPhasesForType(type, workflowId);
+
+        let phases: WorkflowPhase[];
+        if (type === 'CUSTOM' && customName) {
+            const template = this.customWorkflows.get(customName);
+            if (!template) {
+                return {
+                    success: false,
+                    error: new Error(`Custom workflow "${customName}" not found. Available: ${[...this.customWorkflows.keys()].join(', ')}`),
+                };
+            }
+            phases = this.createPhasesFromTemplate(template, workflowId);
+        } else {
+            phases = this.createPhasesForType(type, workflowId);
+        }
 
         // Charger les mémoires disponibles
         const memoryNames = await this.memoryManager.listNames();
@@ -659,6 +680,38 @@ export class Orchestrator {
     }
 
     /**
+     * Auto-dispatch : dispatch les agents puis auto-validate en mode CLI.
+     * En mode manual, retourne les prompts sans valider.
+     */
+    async autoDispatchPhase(feedback: string[] = []): Promise<Result<PhaseDispatchResult & { autoValidated?: boolean; score?: ScoreResult }>> {
+        const dispatchResult = await this.dispatchPhase(feedback);
+        if (!dispatchResult.success || !dispatchResult.data) {
+            return dispatchResult;
+        }
+
+        // En mode CLI, auto-valider avec les outputs
+        if (this.dispatchMode === 'cli') {
+            const validateResult = await this.validatePhase();
+            return {
+                success: true,
+                data: {
+                    ...dispatchResult.data,
+                    autoValidated: true,
+                    score: validateResult.data,
+                },
+            };
+        }
+
+        return {
+            success: true,
+            data: {
+                ...dispatchResult.data,
+                autoValidated: false,
+            },
+        };
+    }
+
+    /**
      * Genere les prompts manuels pour la phase courante
      */
     async getManualPrompts(feedback: string[] = []): Promise<Result<ManualDispatchPrompt[]>> {
@@ -711,6 +764,49 @@ export class Orchestrator {
      */
     getAgentRegistry(): AgentRegistry {
         return this.agentRegistry;
+    }
+
+    /**
+     * Liste les snapshots disponibles
+     */
+    listSnapshots() {
+        return this.snapshotManager.listSnapshots();
+    }
+
+    /**
+     * Cree un snapshot manuel
+     */
+    async createSnapshot(description: string) {
+        this.ensureInitialized();
+        const workflowId = this.currentWorkflow?.id || 'manual';
+        const phaseId = 'manual';
+        return this.snapshotManager.createSnapshot(workflowId, phaseId, description);
+    }
+
+    /**
+     * Liste les workflows custom disponibles
+     */
+    listCustomWorkflows(): Array<{ name: string; description: string; phaseCount: number }> {
+        return [...this.customWorkflows.entries()].map(([name, tpl]) => ({
+            name,
+            description: tpl.description,
+            phaseCount: tpl.phases.length,
+        }));
+    }
+
+    /**
+     * Retourne les infos de la phase courante
+     */
+    getCurrentPhaseInfo(): { phase: WorkflowPhase; agents: AgentDefinition[] } | null {
+        if (!this.currentWorkflow) return null;
+        const phase = this.currentWorkflow.phases[this.currentWorkflow.currentPhaseIndex];
+        if (!phase) return null;
+
+        const agents = phase.agents
+            .map(id => this.agentRegistry.get(id))
+            .filter((a): a is AgentDefinition => a !== undefined);
+
+        return { phase, agents };
     }
 
     // ========================================================================
@@ -770,7 +866,7 @@ export class Orchestrator {
     // ========================================================================
 
     private createPhasesForType(type: WorkflowType, workflowId: string): WorkflowPhase[] {
-        const phaseTemplates: Record<WorkflowType, Array<{ name: string; agents: string[] }>> = {
+        const phaseTemplates: Partial<Record<WorkflowType, Array<{ name: string; agents: string[] }>>> = {
             BUILD: [
                 { name: 'Design', agents: ['fullstack-ui-architect'] },
                 { name: 'Code', agents: ['fullstack-ui-architect'] },
@@ -806,9 +902,9 @@ export class Orchestrator {
             ],
         };
 
-        const templates = phaseTemplates[type] || phaseTemplates.BUILD;
+        const templates = phaseTemplates[type] || phaseTemplates.BUILD!;
 
-        return templates.map((template, index) => ({
+        return templates!.map((template, index) => ({
             id: `${workflowId}_phase_${index}`,
             name: template.name,
             description: `Phase ${index + 1}: ${template.name}`,
@@ -827,6 +923,43 @@ export class Orchestrator {
     // ========================================================================
     // HELPERS
     // ========================================================================
+
+    private async loadCustomWorkflows(): Promise<void> {
+        const workflowsDir = join(this.projectRoot, '.claude', 'orchestrator', 'workflows');
+        try {
+            const files = await readdir(workflowsDir);
+            for (const file of files.filter(f => f.endsWith('.json'))) {
+                try {
+                    const content = await readFile(join(workflowsDir, file), 'utf-8');
+                    const tpl = JSON.parse(content) as CustomWorkflowTemplate;
+                    if (tpl.name && tpl.phases?.length > 0) {
+                        this.customWorkflows.set(tpl.name, tpl);
+                    }
+                } catch (err) {
+                    console.error(`Failed to load custom workflow from ${file}:`, err);
+                }
+            }
+        } catch {
+            // Directory doesn't exist
+        }
+    }
+
+    private createPhasesFromTemplate(template: CustomWorkflowTemplate, workflowId: string): WorkflowPhase[] {
+        return template.phases.map((phase, index) => ({
+            id: `${workflowId}_phase_${index}`,
+            name: phase.name,
+            description: phase.description || `Phase ${index + 1}: ${phase.name}`,
+            agents: phase.agents,
+            dependencies: index > 0 ? [`${workflowId}_phase_${index - 1}`] : [],
+            status: 'PENDING' as const,
+            iteration: 0,
+            maxIterations: phase.maxIterations ?? 3,
+            score: null,
+            startedAt: null,
+            completedAt: null,
+            output: null,
+        }));
+    }
 
     private calculateProgress(): number {
         if (!this.currentWorkflow) return 0;

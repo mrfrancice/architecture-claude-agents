@@ -1,0 +1,42 @@
+{
+  "name": "api-feature",
+  "description": "Workflow pour creer une feature API complete (design → implementation → tests → docs)",
+  "phases": [
+    {
+      "name": "API Design",
+      "description": "Concevoir les endpoints, schemas et contrats API",
+      "agents": ["distributed-systems-architect"],
+      "maxIterations": 2
+    },
+    {
+      "name": "Database Schema",
+      "description": "Concevoir le schema de base de donnees et les migrations",
+      "agents": ["database-optimization-expert"],
+      "maxIterations": 2
+    },
+    {
+      "name": "Implementation",
+      "description": "Implementer les endpoints API et la logique metier",
+      "agents": ["fullstack-ui-architect"],
+      "maxIterations": 3
+    },
+    {
+      "name": "Tests",
+      "description": "Ecrire les tests unitaires et d'integration",
+      "agents": ["test-automation-strategist"],
+      "maxIterations": 2
+    },
+    {
+      "name": "Security Review",
+      "description": "Audit de securite de l'API",
+      "agents": ["security-expert"],
+      "maxIterations": 1
+    },
+    {
+      "name": "Documentation",
+      "description": "Documenter l'API (OpenAPI, guides)",
+      "agents": ["technical-writer"],
+      "maxIterations": 1
+    }
+  ]
+}

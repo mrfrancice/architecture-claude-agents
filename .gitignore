@@ -1,5 +1,12 @@
 node_modules/
 dist/
 *.tsbuildinfo
-.claude/orchestrator/
+nul
+
+# Runtime data (not config)
+.claude/orchestrator/state.json
+.claude/orchestrator/history.json
+.claude/orchestrator/stats.json
+.claude/orchestrator/snapshots/
 .claude/memories/
+.claude/settings.local.json

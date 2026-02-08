@@ -1,0 +1,28 @@
+{
+  "hooks": [
+    {
+      "name": "log-workflow-start",
+      "event": "workflow:started",
+      "command": "echo \"Workflow started: ${type} - ${task}\"",
+      "enabled": true
+    },
+    {
+      "name": "log-phase-complete",
+      "event": "phase:completed",
+      "command": "echo \"Phase ${phaseId} completed with score ${score}\"",
+      "enabled": true
+    },
+    {
+      "name": "notify-workflow-complete",
+      "event": "workflow:completed",
+      "command": "echo \"Workflow ${workflowId} finished! Score: ${totalScore}\"",
+      "enabled": true
+    },
+    {
+      "name": "warn-on-failure",
+      "event": "workflow:failed",
+      "command": "echo \"WARNING: Workflow ${workflowId} failed: ${reason}\"",
+      "enabled": true
+    }
+  ]
+}

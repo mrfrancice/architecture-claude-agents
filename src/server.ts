@@ -36,13 +36,13 @@ const TOOLS: Tool[] = [
     agentsTool,
 ];
 
-const VALID_WORKFLOW_TYPES = new Set(['BUILD', 'REVIEW', 'OPTIMIZE', 'DESIGN', 'DEBUG', 'SECURITY_AUDIT']);
+const VALID_WORKFLOW_TYPES = new Set(['BUILD', 'REVIEW', 'OPTIMIZE', 'DESIGN', 'DEBUG', 'SECURITY_AUDIT', 'CUSTOM']);
 
 type ToolHandler = (args: Record<string, unknown>, orch: Orchestrator) => Promise<unknown>;
 
 const TOOL_HANDLERS: Record<string, ToolHandler> = {
     'orchestrator_workflow': async (args, orch) => {
-        const { action, type, task } = args as { action: string; type?: string; task?: string };
+        const { action, type, task, custom_name } = args as { action: string; type?: string; task?: string; custom_name?: string };
         switch (action) {
             case 'start': {
                 const workflowType = type || 'BUILD';
@@ -52,7 +52,10 @@ const TOOL_HANDLERS: Record<string, ToolHandler> = {
                 if (!task) {
                     throw new Error('Parameter "task" is required for action "start"');
                 }
-                return orch.startWorkflow(workflowType as Parameters<Orchestrator['startWorkflow']>[0], task);
+                if (workflowType === 'CUSTOM' && !custom_name) {
+                    throw new Error('Parameter "custom_name" is required when type is "CUSTOM"');
+                }
+                return orch.startWorkflow(workflowType as Parameters<Orchestrator['startWorkflow']>[0], task, custom_name);
             }
             case 'pause':
                 return orch.pauseWorkflow();
@@ -62,8 +65,12 @@ const TOOL_HANDLERS: Record<string, ToolHandler> = {
                 return orch.cancelWorkflow();
             case 'status':
                 return orch.getWorkflowStatus();
+            case 'phases':
+                return orch.getCurrentPhaseInfo();
+            case 'list_custom':
+                return orch.listCustomWorkflows();
             default:
-                throw new Error(`Unknown action: "${action}". Valid actions: start, pause, resume, cancel, status`);
+                throw new Error(`Unknown action: "${action}". Valid actions: start, pause, resume, cancel, status, phases, list_custom`);
         }
     },
 
@@ -78,8 +85,17 @@ const TOOL_HANDLERS: Record<string, ToolHandler> = {
     },
 
     'orchestrator_rollback': async (args, orch) => {
-        const { snapshotId } = args as { snapshotId?: string };
-        return orch.rollback(snapshotId);
+        const { action, snapshotId, description } = args as { action?: string; snapshotId?: string; description?: string };
+        switch (action || 'restore') {
+            case 'restore':
+                return orch.rollback(snapshotId);
+            case 'list':
+                return orch.listSnapshots();
+            case 'create':
+                return orch.createSnapshot(description || 'Manual snapshot');
+            default:
+                throw new Error(`Unknown action: "${action}". Valid actions: restore, list, create`);
+        }
     },
 
     'orchestrator_memory': async (args, orch) => {
@@ -107,7 +123,10 @@ const TOOL_HANDLERS: Record<string, ToolHandler> = {
     },
 
     'orchestrator_agents': async (args, orch) => {
-        const { action, agent_id, mode } = args as { action: string; agent_id?: string; mode?: string };
+        const { action, agent_id, mode, name, system_prompt, description, capabilities } = args as {
+            action: string; agent_id?: string; mode?: string;
+            name?: string; system_prompt?: string; description?: string; capabilities?: string[];
+        };
         const registry = orch.getAgentRegistry();
 
         switch (action) {
@@ -128,6 +147,9 @@ const TOOL_HANDLERS: Record<string, ToolHandler> = {
             case 'dispatch':
                 return orch.dispatchPhase();
 
+            case 'auto_dispatch':
+                return orch.autoDispatchPhase();
+
             case 'set_mode':
                 if (!mode) throw new Error('Parameter "mode" is required for action "set_mode"');
                 if (mode !== 'manual' && mode !== 'cli') {
@@ -139,7 +161,7 @@ const TOOL_HANDLERS: Record<string, ToolHandler> = {
             case 'get_mode':
                 return { mode: orch.getDispatchMode() };
 
-            case 'get_prompt':
+            case 'get_prompt': {
                 if (!agent_id) throw new Error('Parameter "agent_id" is required for action "get_prompt"');
                 const prompts = await orch.getManualPrompts();
                 if (!prompts.success || !prompts.data) {
@@ -150,9 +172,28 @@ const TOOL_HANDLERS: Record<string, ToolHandler> = {
                     throw new Error(`Agent "${agent_id}" is not assigned to the current phase`);
                 }
                 return agentPrompt;
+            }
+
+            case 'current_phase':
+                return orch.getCurrentPhaseInfo();
+
+            case 'register': {
+                if (!agent_id) throw new Error('Parameter "agent_id" is required for action "register"');
+                if (!name) throw new Error('Parameter "name" is required for action "register"');
+                if (!system_prompt) throw new Error('Parameter "system_prompt" is required for action "register"');
+                registry.register({
+                    id: agent_id,
+                    name,
+                    description: description || '',
+                    systemPrompt: system_prompt,
+                    capabilities: capabilities || [],
+                    builtIn: false,
+                });
+                return { registered: agent_id, total: registry.list().length };
+            }
 
             default:
-                throw new Error(`Unknown action: "${action}". Valid actions: list, get, dispatch, set_mode, get_mode, get_prompt`);
+                throw new Error(`Unknown action: "${action}". Valid actions: list, get, dispatch, auto_dispatch, set_mode, get_mode, get_prompt, current_phase, register`);
         }
     },
 };
