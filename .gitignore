@@ -1,3 +1,6 @@
 node_modules/
 dist/
 *.tsbuildinfo
+
+# Orchestrator runtime state (session-specific, not shareable)
+.claude/orchestrator/

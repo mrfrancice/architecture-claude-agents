@@ -9,7 +9,7 @@ export type TaskId = string;
 export type AgentId = string;
 export type SnapshotId = string;
 
-export type WorkflowType = 'BUILD' | 'REVIEW' | 'OPTIMIZE' | 'DESIGN' | 'DEBUG' | 'SECURITY_AUDIT';
+export type WorkflowType = 'BUILD' | 'REVIEW' | 'OPTIMIZE' | 'DESIGN' | 'DEBUG' | 'SECURITY_AUDIT' | 'CUSTOM';
 export type WorkflowStatus = 'PENDING' | 'RUNNING' | 'PAUSED' | 'COMPLETE' | 'FAILED' | 'CANCELLED';
 export type PhaseStatus = 'PENDING' | 'RUNNING' | 'PASS' | 'ITERATE' | 'FAIL' | 'SKIPPED';
 
@@ -26,6 +26,9 @@ export interface WorkflowPhase {
     startedAt: Date | null;
     completedAt: Date | null;
     output: PhaseOutput | null;
+    lastFeedback: string[];
+    forcePromoted: boolean;
+    mode: PhaseMode;
 }
 
 export interface PhaseOutput {
@@ -33,6 +36,7 @@ export interface PhaseOutput {
     filesModified: string[];
     errors: string[];
     warnings: string[];
+    consolidatedOutput?: string;
 }
 
 export interface AgentOutput {
@@ -43,6 +47,7 @@ export interface AgentOutput {
     filesModified: string[];
     duration: number;
     score: ScoreResult | null;
+    summary?: string;
 }
 
 export interface Workflow {
@@ -115,3 +120,106 @@ export interface Result<T, E = Error> {
 }
 
 export type AsyncResult<T, E = Error> = Promise<Result<T, E>>;
+
+// ============================================================================
+// AGENT DISPATCH TYPES
+// ============================================================================
+
+export type DispatchMode = 'manual' | 'cli';
+export type PhaseMode = 'interactive' | 'non-interactive';
+
+export interface AgentDefinition {
+    id: AgentId;
+    name: string;
+    description: string;
+    systemPrompt: string;
+    capabilities: string[];
+    model?: string;
+    domain?: string;
+    level?: string;
+    collaboratesWith?: string[];
+    escalatesTo?: string;
+    builtIn: boolean;
+}
+
+export interface AgentContext {
+    agent: AgentDefinition;
+    task: string;
+    phase: {
+        id: PhaseId;
+        name: string;
+        description: string;
+        iteration: number;
+        maxIterations: number;
+        feedback: string[];
+        mode: PhaseMode;
+    };
+    previousPhases: PreviousPhaseInfo[];
+    peerOutputs: Record<AgentId, string>;
+    memories: Record<string, string>;
+    projectInfo: ProjectInfo;
+}
+
+export interface PreviousPhaseInfo {
+    phaseId: PhaseId;
+    phaseName: string;
+    status: PhaseStatus;
+    score: number | null;
+    agentOutputs: Record<AgentId, string>;
+    filesModified: string[];
+    consolidatedOutput?: string;
+}
+
+export interface DispatchResult {
+    agentId: AgentId;
+    mode: DispatchMode;
+    status: 'SUCCESS' | 'PARTIAL' | 'FAILED';
+    output: string;
+    duration: number;
+    retryCount?: number;
+    error?: string;
+}
+
+export interface ManualDispatchPrompt {
+    agentId: AgentId;
+    agentName: string;
+    systemPrompt: string;
+    userPrompt: string;
+    model?: string;
+}
+
+export interface PhaseDispatchResult {
+    phaseId: PhaseId;
+    phaseName: string;
+    mode: DispatchMode;
+    results: DispatchResult[];
+    prompts?: ManualDispatchPrompt[];
+}
+
+export interface HookDefinition {
+    name: string;
+    description: string;
+    event: string;
+    matchTools?: string[];
+    instructions: string;
+    enabled: boolean;
+}
+
+export interface SkillDefinition {
+    name: string;
+    description: string;
+    arguments: Array<{ name: string; description: string; required: boolean; default?: string }>;
+    instructions: string;
+}
+
+export interface CustomWorkflowTemplate {
+    name: string;
+    description: string;
+    phases: Array<{
+        name: string;
+        description?: string;
+        agents: AgentId[];
+        maxIterations?: number;
+        mode?: PhaseMode;
+    }>;
+}
