@@ -269,6 +269,10 @@ export class TerminalDispatcher {
     }): string {
         const { agentId, agentName, modelArg, phaseName, iteration, safeTask } = params;
 
+        // Interactive mode uses --print just like non-interactive, but the PROMPT
+        // instructs the agent to use tools (Read, Write, Edit, Bash) to create/modify
+        // files on disk. The agent works autonomously and exits when done — no human
+        // interaction needed. The visual header distinguishes it from analysis phases.
         return `# UTF-8 encoding for proper accent/unicode support
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 $OutputEncoding = [System.Text.Encoding]::UTF8
@@ -289,25 +293,16 @@ trap {
     break
 }
 
-$host.UI.RawUI.WindowTitle = "[${phaseName}] ${agentName} (Interactive)"
+$host.UI.RawUI.WindowTitle = "[${phaseName}] ${agentName} (Code)"
 
-# Resolve the session directory once and ensure it persists
-$sessionDir = $PSScriptRoot
-$outputFile = Join-Path $sessionDir "output_${agentId}.txt"
-$doneFile   = Join-Path $sessionDir "done_${agentId}.txt"
-
-# Helper: ensure session dir exists before writing (it may have been cleaned by another process)
-function Ensure-SessionDir {
-    if (!(Test-Path $sessionDir)) {
-        New-Item -ItemType Directory -Path $sessionDir -Force | Out-Null
-    }
-}
+$outputFile = Join-Path $PSScriptRoot "output_${agentId}.txt"
+$doneFile   = Join-Path $PSScriptRoot "done_${agentId}.txt"
 
 try {
     $ErrorActionPreference = "Stop"
 
-    $systemPrompt = Get-Content (Join-Path $sessionDir "system_${agentId}.txt") -Raw -Encoding UTF8
-    $userPrompt   = Get-Content (Join-Path $sessionDir "user_${agentId}.txt") -Raw -Encoding UTF8
+    $systemPrompt = Get-Content (Join-Path $PSScriptRoot "system_${agentId}.txt") -Raw -Encoding UTF8
+    $userPrompt   = Get-Content (Join-Path $PSScriptRoot "user_${agentId}.txt") -Raw -Encoding UTF8
 
     # Verify claude CLI is accessible
     $null = Get-Command claude -ErrorAction Stop
@@ -316,11 +311,11 @@ try {
 
     # ── Display full context before execution ──
     Write-Host ""
-    Write-Host "  ================================================================" -ForegroundColor Cyan
-    Write-Host "    AGENT: ${agentName} (INTERACTIVE)" -ForegroundColor Yellow
-    Write-Host "    Phase: ${phaseName} | Iteration ${iteration}" -ForegroundColor Gray
-    Write-Host "    Mode:  Tapez /exit pour terminer la session" -ForegroundColor Magenta
-    Write-Host "  ================================================================" -ForegroundColor Cyan
+    Write-Host "  ================================================================" -ForegroundColor Magenta
+    Write-Host "    AGENT: ${agentName}" -ForegroundColor Yellow
+    Write-Host "    Phase: ${phaseName} | Iteration ${iteration} | Mode: CODE" -ForegroundColor Gray
+    Write-Host "    L'agent ecrit du code sur le disque (autonome)" -ForegroundColor Green
+    Write-Host "  ================================================================" -ForegroundColor Magenta
     Write-Host ""
     Write-Host "  TACHE:" -ForegroundColor White
     Write-Host '  ${safeTask}' -ForegroundColor White
@@ -336,38 +331,24 @@ try {
     }
     Write-Host ""
     Write-Host "  ----------------------------------------------------------------" -ForegroundColor DarkGray
-    Write-Host "  Lancement de claude en mode interactif..." -ForegroundColor Green
+    Write-Host "  Execution en cours (code generation)..." -ForegroundColor Green
     Write-Host "  ----------------------------------------------------------------" -ForegroundColor DarkGray
     Write-Host ""
 
     $startTime = Get-Date
 
-    # Build the combined system prompt: original system prompt + task context as append
-    # Claude launched WITHOUT a positional prompt argument stays in interactive TUI mode.
-    # The user prompt is injected via --append-system-prompt so the agent has full context
-    # but the user can still type and interact freely.
-    $taskContext = "TASK CONTEXT (respond to this first, then the user can continue the conversation):" + [Environment]::NewLine + [Environment]::NewLine + $userPrompt
-    $claudeArgs = @('--system-prompt', $systemPrompt, '--append-system-prompt', $taskContext, ${modelArg} '--verbose')
-    & claude @claudeArgs
+    # Run claude --print: the agent works autonomously using tools (Read, Write, Edit, Bash)
+    # to create and modify files on disk. It exits automatically when done.
+    $claudeArgs = @('--print', '--system-prompt', $systemPrompt, ${modelArg} $userPrompt)
+    $claudeOutput = & claude @claudeArgs 2>&1 | ForEach-Object { Write-Host $_; $_ }
 
     $exitCode = $LASTEXITCODE
+
+    # Write output as UTF-8 (no BOM)
+    $utf8NoBom = New-Object System.Text.UTF8Encoding $false
+    [System.IO.File]::WriteAllText($outputFile, ($claudeOutput -join [Environment]::NewLine), $utf8NoBom)
     $duration = ((Get-Date) - $startTime).TotalSeconds
 
-    # After claude exits, export the conversation using claude --continue --print
-    # to capture the full conversation as text output
-    Write-Host ""
-    Write-Host "  Exporting conversation..." -ForegroundColor DarkGray
-    Ensure-SessionDir
-    try {
-        $exportArgs = @('--continue', '--print', '-p', 'Please output a complete summary of everything we discussed and all conclusions/code/recommendations produced in this session. Format as markdown.')
-        $exportOutput = & claude @exportArgs 2>&1
-        $exportOutput | Out-File $outputFile -Encoding UTF8
-    } catch {
-        # Fallback: write a note that export failed
-        "Interactive session completed but export failed: $($_.Exception.Message)" | Out-File $outputFile -Encoding UTF8
-    }
-
-    Ensure-SessionDir
     if ($exitCode -and $exitCode -ne 0) {
         Write-Host ""
         Write-Host "  === ECHEC (exit code: $exitCode, $([math]::Round($duration))s) ===" -ForegroundColor Yellow
@@ -382,7 +363,6 @@ try {
     $errMsg = $_.Exception.Message
     Write-Host ""
     Write-Host "  === ERREUR: $errMsg ===" -ForegroundColor Red
-    Ensure-SessionDir
     try { $errMsg | Out-File $outputFile -Encoding UTF8 } catch {}
     try { "FAILED:$duration" | Out-File $doneFile -Encoding UTF8 } catch {}
 }

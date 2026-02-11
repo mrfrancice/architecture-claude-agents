@@ -1402,7 +1402,7 @@ describe('TerminalDispatcher - Interactive Script Generation', () => {
         vi.restoreAllMocks();
     });
 
-    it('should generate interactive PS1 script without --print', async () => {
+    it('should generate interactive PS1 script with --print (autonomous code mode)', async () => {
         vi.spyOn(termDisp as any, 'launchTerminalPanes').mockResolvedValue(undefined);
 
         const prompts: ManualDispatchPrompt[] = [{
@@ -1415,16 +1415,20 @@ describe('TerminalDispatcher - Interactive Script Generation', () => {
         const session = await termDisp.spawnSession(prompts, '/test', undefined, true);
         const scriptContent = await readFile(session.agents[0].scriptPath, 'utf-8');
 
-        // Should NOT contain --print in the main claude launch
-        // (--print is used only in the post-session export step)
-        expect(scriptContent).toContain('--append-system-prompt');
+        // Interactive mode now uses --print (autonomous, no human interaction needed)
+        expect(scriptContent).toContain("'--print'");
 
-        // Should contain interactive indicators
-        expect(scriptContent).toContain('INTERACTIVE');
-        expect(scriptContent).toContain('/exit');
+        // Should contain code-mode visual indicators
+        expect(scriptContent).toContain('Mode: CODE');
+        expect(scriptContent).toContain('autonome');
 
-        // Should have a post-session export step using --continue --print
-        expect(scriptContent).toContain('--continue');
+        // Should NOT contain old TUI-mode artifacts
+        expect(scriptContent).not.toContain('--append-system-prompt');
+        expect(scriptContent).not.toContain('/exit');
+        expect(scriptContent).not.toContain('--continue');
+
+        // Should have TERMINE indicator for completion
+        expect(scriptContent).toContain('TERMINE');
     });
 
     it('should generate non-interactive PS1 script with --print when interactive=false', async () => {
