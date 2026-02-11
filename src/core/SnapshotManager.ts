@@ -32,6 +32,17 @@ export interface Snapshot {
     description: string;
 }
 
+export interface SnapshotResult {
+    snapshot: Snapshot | null;
+    warning?: string;
+}
+
+export interface FileBaseline {
+    untracked: Set<string>;
+    modified: Set<string>;
+    staged: Set<string>;
+}
+
 // ============================================================================
 // SNAPSHOT MANAGER
 // ============================================================================
@@ -61,12 +72,13 @@ export class SnapshotManager {
     /**
      * Crée un snapshot avant une phase
      */
-    async createSnapshot(workflowId: WorkflowId, phaseId: PhaseId, description: string): Promise<Snapshot | null> {
+    async createSnapshot(workflowId: WorkflowId, phaseId: PhaseId, description: string): Promise<SnapshotResult> {
         try {
             const isGitRepo = await this.isGitRepository();
             if (!isGitRepo) {
-                console.error('SnapshotManager: Not a git repository, skipping snapshot');
-                return null;
+                const warning = 'SnapshotManager: Not a git repository. Snapshots are disabled. Initialize a git repo to enable rollback capabilities.';
+                console.error(warning);
+                return { snapshot: null, warning };
             }
 
             const commitHash = await this.getCurrentCommitHash();
@@ -100,10 +112,11 @@ export class SnapshotManager {
                 await this.applyStash(stashRef);
             }
 
-            return snapshot;
+            return { snapshot };
         } catch (err) {
-            console.error('SnapshotManager: Failed to create snapshot:', err);
-            return null;
+            const warning = `SnapshotManager: Failed to create snapshot: ${err instanceof Error ? err.message : String(err)}`;
+            console.error(warning);
+            return { snapshot: null, warning };
         }
     }
 
@@ -166,6 +179,131 @@ export class SnapshotManager {
      */
     listSnapshots(): Snapshot[] {
         return [...this.snapshots];
+    }
+
+    /**
+     * Returns the current HEAD commit hash (public accessor for git diff tracking)
+     */
+    async getHeadCommitHash(): Promise<string | null> {
+        try {
+            const isGitRepo = await this.isGitRepository();
+            if (!isGitRepo) return null;
+            return await this.getCurrentCommitHash();
+        } catch {
+            return null;
+        }
+    }
+
+    /**
+     * Captures a baseline of all currently known files (untracked, modified, staged).
+     * Call this BEFORE dispatching an interactive phase, then pass the result
+     * to getChangedFiles() AFTER the phase to get only the delta.
+     */
+    async captureFileBaseline(): Promise<FileBaseline> {
+        const baseline: FileBaseline = { untracked: new Set(), modified: new Set(), staged: new Set() };
+        try {
+            const isGitRepo = await this.isGitRepository();
+            if (!isGitRepo) return baseline;
+
+            // Untracked files
+            const untrackedOutput = await this.git('ls-files', '--others', '--exclude-standard');
+            for (const f of untrackedOutput.split('\n').filter(Boolean)) {
+                baseline.untracked.add(f);
+            }
+
+            // Unstaged modifications
+            const modifiedOutput = await this.git('diff', '--name-only');
+            for (const f of modifiedOutput.split('\n').filter(Boolean)) {
+                baseline.modified.add(f);
+            }
+
+            // Staged changes
+            const stagedOutput = await this.git('diff', '--cached', '--name-only');
+            for (const f of stagedOutput.split('\n').filter(Boolean)) {
+                baseline.staged.add(f);
+            }
+        } catch {
+            // Ignore errors
+        }
+        return baseline;
+    }
+
+    /**
+     * Returns files changed since a given commit hash.
+     * Uses git diff --name-status for tracked changes and git ls-files for new untracked files.
+     * When a baseline is provided, only returns files NOT present in the baseline (delta).
+     */
+    async getChangedFiles(sinceCommit?: string, baseline?: FileBaseline): Promise<{ created: string[]; modified: string[]; deleted: string[] }> {
+        const result = { created: [] as string[], modified: [] as string[], deleted: [] as string[] };
+
+        try {
+            const isGitRepo = await this.isGitRepository();
+            if (!isGitRepo) return result;
+
+            if (sinceCommit) {
+                // Tracked changes since the given commit
+                const diffOutput = await this.git('diff', '--name-status', sinceCommit);
+                for (const line of diffOutput.split('\n').filter(Boolean)) {
+                    const [status, ...fileParts] = line.split('\t');
+                    const file = fileParts.join('\t');
+                    if (!file) continue;
+                    switch (status) {
+                        case 'A': result.created.push(file); break;
+                        case 'M': result.modified.push(file); break;
+                        case 'D': result.deleted.push(file); break;
+                        default:
+                            if (status?.startsWith('R')) {
+                                result.modified.push(fileParts[fileParts.length - 1] || file);
+                            } else {
+                                result.modified.push(file);
+                            }
+                    }
+                }
+            }
+
+            // Untracked files (newly created, not yet added to git)
+            const untrackedOutput = await this.git('ls-files', '--others', '--exclude-standard');
+            for (const file of untrackedOutput.split('\n').filter(Boolean)) {
+                if (!result.created.includes(file)) {
+                    result.created.push(file);
+                }
+            }
+
+            // Also check staged but uncommitted changes
+            try {
+                const stagedOutput = await this.git('diff', '--cached', '--name-status');
+                for (const line of stagedOutput.split('\n').filter(Boolean)) {
+                    const [status, ...fileParts] = line.split('\t');
+                    const file = fileParts.join('\t');
+                    if (!file) continue;
+                    switch (status) {
+                        case 'A':
+                            if (!result.created.includes(file)) result.created.push(file);
+                            break;
+                        case 'M':
+                            if (!result.modified.includes(file)) result.modified.push(file);
+                            break;
+                        case 'D':
+                            if (!result.deleted.includes(file)) result.deleted.push(file);
+                            break;
+                    }
+                }
+            } catch {
+                // Ignore errors from staged diff
+            }
+
+            // If a baseline was provided, subtract files that already existed before the phase
+            if (baseline) {
+                const allBaseline = new Set([...baseline.untracked, ...baseline.modified, ...baseline.staged]);
+                result.created = result.created.filter(f => !allBaseline.has(f));
+                result.modified = result.modified.filter(f => !allBaseline.has(f));
+                // deleted: keep all — if a file was deleted during the phase, that's new
+            }
+
+            return result;
+        } catch {
+            return result;
+        }
     }
 
     /**

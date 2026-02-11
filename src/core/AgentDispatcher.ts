@@ -23,10 +23,13 @@ import type {
     Workflow,
     WorkflowPhase,
     AgentDefinition,
+    TerminalSession,
+    TerminalSessionStatus,
 } from '../types/core.js';
 import { AgentRegistry } from './AgentRegistry.js';
 import { MemoryManager } from './MemoryManager.js';
 import { EventBus } from './EventBus.js';
+import { TerminalDispatcher } from './TerminalDispatcher.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -71,6 +74,7 @@ export class ContextPipeline {
                 iteration: phase.iteration,
                 maxIterations: phase.maxIterations,
                 feedback,
+                mode: phase.mode || 'non-interactive',
             },
             previousPhases,
             peerOutputs,
@@ -91,6 +95,15 @@ export class ContextPipeline {
         // Phase courante
         parts.push(`\n## Current Phase: ${context.phase.name}\n${context.phase.description}`);
 
+        // Interactive mode instructions for code-producing phases
+        if (context.phase.mode === 'interactive') {
+            parts.push(`\n## Execution Mode: Interactive`);
+            parts.push(`You have full access to tools (Read, Write, Edit, Bash). Create and modify files directly on disk.`);
+            parts.push(`Follow the project's existing conventions and coding style.`);
+            parts.push(`Run tests after making changes to verify correctness.`);
+            parts.push(`Do NOT just output text — actually write the code and create the files.`);
+        }
+
         if (context.phase.iteration > 1) {
             parts.push(`\n**Iteration ${context.phase.iteration}/${context.phase.maxIterations}**`);
         }
@@ -105,6 +118,9 @@ export class ContextPipeline {
             parts.push('\n## Previous Phases Output');
             for (const prev of context.previousPhases) {
                 parts.push(`\n### ${prev.phaseName} (${prev.status}, score: ${prev.score ?? 'N/A'})`);
+                if (prev.filesModified.length > 0) {
+                    parts.push(`\n**Files modified:** ${prev.filesModified.join(', ')}`);
+                }
                 for (const [aid, output] of Object.entries(prev.agentOutputs)) {
                     const truncated = output.length > 2000 ? output.slice(0, 2000) + '\n... [truncated]' : output;
                     parts.push(`\n**Agent ${aid}:**\n${truncated}`);
@@ -155,6 +171,7 @@ export class ContextPipeline {
                 status: phase.status,
                 score: phase.score,
                 agentOutputs,
+                filesModified: phase.output.filesModified || [],
             });
         }
 
@@ -185,6 +202,9 @@ export class AgentDispatcher {
     private registry: AgentRegistry;
     private pipeline: ContextPipeline;
     private eventBus: EventBus;
+    private terminalDispatcher: TerminalDispatcher;
+    private currentTerminalSession: TerminalSession | null = null;
+    private interactive = false;
 
     constructor(
         registry: AgentRegistry,
@@ -196,6 +216,7 @@ export class AgentDispatcher {
         this.registry = registry;
         this.pipeline = new ContextPipeline(registry, memoryManager);
         this.eventBus = eventBus;
+        this.terminalDispatcher = new TerminalDispatcher();
     }
 
     getMode(): DispatchMode {
@@ -204,6 +225,14 @@ export class AgentDispatcher {
 
     setMode(mode: DispatchMode): void {
         this.mode = mode;
+    }
+
+    getInteractive(): boolean {
+        return this.interactive;
+    }
+
+    setInteractive(val: boolean): void {
+        this.interactive = val;
     }
 
     /**
@@ -227,6 +256,57 @@ export class AgentDispatcher {
         const results: DispatchResult[] = [];
         const prompts: ManualDispatchPrompt[] = [];
         const peerOutputs: Record<AgentId, string> = {};
+
+        // Mode terminal : spawn les panes et retour immediat
+        if (this.mode === 'terminal') {
+            for (const agentId of agentIds) {
+                const context = await this.pipeline.buildContext(agentId, workflow, phase, feedback, peerOutputs);
+                prompts.push(this.buildManualPrompt(context));
+
+                results.push({
+                    agentId,
+                    mode: 'terminal',
+                    status: 'SUCCESS',
+                    output: '',
+                    duration: 0,
+                });
+            }
+
+            const session = await this.terminalDispatcher.spawnSession(
+                prompts,
+                workflow.context.projectInfo.rootPath,
+                {
+                    phaseName: phase.name,
+                    iteration: phase.iteration,
+                    task: workflow.task,
+                },
+                this.interactive,
+            );
+            this.currentTerminalSession = session;
+
+            await this.eventBus.emit('agent:terminalSpawned', {
+                workflowId: workflow.id,
+                phaseId: phase.id,
+                agents: agentIds,
+                sessionDir: session.sessionDir,
+            });
+
+            await this.eventBus.emit('agent:phaseDispatchCompleted', {
+                workflowId: workflow.id,
+                phaseId: phase.id,
+                agentCount: agentIds.length,
+                mode: this.mode,
+            });
+
+            return {
+                phaseId: phase.id,
+                phaseName: phase.name,
+                mode: this.mode,
+                results,
+                prompts,
+                terminalSession: session,
+            };
+        }
 
         for (const agentId of agentIds) {
             const context = await this.pipeline.buildContext(agentId, workflow, phase, feedback, peerOutputs);
@@ -328,6 +408,47 @@ export class AgentDispatcher {
             errors,
             warnings: [],
         };
+    }
+
+    // ========================================================================
+    // TERMINAL SESSION
+    // ========================================================================
+
+    /**
+     * Retourne le statut de la session terminal en cours
+     */
+    async getTerminalStatus(): Promise<TerminalSessionStatus | null> {
+        if (!this.currentTerminalSession) return null;
+        return this.terminalDispatcher.getStatus(this.currentTerminalSession);
+    }
+
+    /**
+     * Collecte les outputs de la session terminal en cours
+     */
+    async collectTerminalOutputs(): Promise<Record<AgentId, string> | null> {
+        if (!this.currentTerminalSession) return null;
+        return this.terminalDispatcher.collectOutputs(this.currentTerminalSession);
+    }
+
+    /**
+     * Retourne la session terminal en cours
+     */
+    getCurrentTerminalSession(): TerminalSession | null {
+        return this.currentTerminalSession;
+    }
+
+    /**
+     * Retourne le TerminalDispatcher sous-jacent
+     */
+    getTerminalDispatcher(): TerminalDispatcher {
+        return this.terminalDispatcher;
+    }
+
+    /**
+     * Remet a zero la session terminal courante
+     */
+    resetTerminalSession(): void {
+        this.currentTerminalSession = null;
     }
 
     // ========================================================================

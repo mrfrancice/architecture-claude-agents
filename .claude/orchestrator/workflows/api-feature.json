@@ -27,6 +27,12 @@
       "maxIterations": 2
     },
     {
+      "name": "Regression",
+      "description": "Lancer la suite de tests complete du projet pour verifier qu'aucune fonctionnalite existante n'a ete cassee par les modifications",
+      "agents": ["test-automation-strategist"],
+      "maxIterations": 2
+    },
+    {
       "name": "Security Review",
       "description": "Audit de securite de l'API",
       "agents": ["security-expert"],

@@ -204,6 +204,37 @@ Guidelines:
         capabilities: ['user-flows', 'wireframes', 'design-systems', 'usability', 'accessibility', 'information-architecture'],
         builtIn: true,
     },
+    {
+        id: 'output-consolidator',
+        name: 'Output Consolidator',
+        description: 'Synthetise les outputs multi-agents en rapport structure',
+        systemPrompt: `You are an Output Consolidator. Your role is to synthesize multiple agent outputs into a single coherent report.
+
+Given the outputs from multiple specialized agents working on the same phase, you must:
+1. Identify the key findings/deliverables from each agent
+2. Detect any conflicts or contradictions between agents
+3. Merge complementary information into a unified view
+4. Highlight action items and critical decisions
+5. Produce a structured summary
+
+Output format:
+## Phase Summary
+[1-2 paragraph synthesis]
+
+## Key Findings
+- [Bullet points of main findings across all agents]
+
+## Conflicts & Decisions Needed
+- [Any contradictions between agent outputs]
+
+## Action Items
+- [Concrete next steps]
+
+## Per-Agent Details
+[Brief per-agent summary for reference]`,
+        capabilities: ['consolidation', 'synthesis', 'report-generation'],
+        builtIn: true,
+    },
 ];
 
 // ============================================================================
@@ -290,6 +321,44 @@ export class AgentRegistry {
     }
 
     /**
+     * Valide qu'un objet JSON contient les champs requis pour un agent
+     */
+    private validateAgentJson(data: unknown, filename: string): AgentDefinition | null {
+        if (typeof data !== 'object' || data === null) {
+            console.error(`Invalid agent definition in ${filename}: expected a JSON object`);
+            return null;
+        }
+
+        const obj = data as Record<string, unknown>;
+        const errors: string[] = [];
+
+        if (typeof obj.id !== 'string' || obj.id.trim() === '') {
+            errors.push('id (string, non-empty)');
+        }
+        if (typeof obj.name !== 'string' || obj.name.trim() === '') {
+            errors.push('name (string, non-empty)');
+        }
+        if (typeof obj.systemPrompt !== 'string' || obj.systemPrompt.trim() === '') {
+            errors.push('systemPrompt (string, non-empty)');
+        }
+
+        if (errors.length > 0) {
+            console.error(`Invalid agent definition in ${filename}: missing or invalid required fields: ${errors.join(', ')}`);
+            return null;
+        }
+
+        return {
+            id: (obj.id as string).trim(),
+            name: (obj.name as string).trim(),
+            description: typeof obj.description === 'string' ? obj.description : '',
+            systemPrompt: obj.systemPrompt as string,
+            capabilities: Array.isArray(obj.capabilities) ? obj.capabilities.filter((c): c is string => typeof c === 'string') : [],
+            model: typeof obj.model === 'string' ? obj.model : undefined,
+            builtIn: false,
+        };
+    }
+
+    /**
      * Charge les agents custom depuis .claude/orchestrator/agents/*.json
      */
     private async loadCustomAgents(): Promise<void> {
@@ -302,22 +371,12 @@ export class AgentRegistry {
             for (const file of jsonFiles) {
                 try {
                     const content = await readFile(join(agentsDir, file), 'utf-8');
-                    const data = JSON.parse(content) as Partial<AgentDefinition>;
+                    const data: unknown = JSON.parse(content);
 
-                    if (!data.id || !data.name || !data.systemPrompt) {
-                        console.error(`Invalid agent definition in ${file}: missing required fields (id, name, systemPrompt)`);
+                    const agent = this.validateAgentJson(data, file);
+                    if (!agent) {
                         continue;
                     }
-
-                    const agent: AgentDefinition = {
-                        id: data.id,
-                        name: data.name,
-                        description: data.description || '',
-                        systemPrompt: data.systemPrompt,
-                        capabilities: data.capabilities || [],
-                        model: data.model,
-                        builtIn: false,
-                    };
 
                     this.agents.set(agent.id, agent);
                 } catch (err) {

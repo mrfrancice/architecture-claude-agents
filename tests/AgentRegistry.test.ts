@@ -16,7 +16,7 @@ describe('AgentRegistry', () => {
 
     it('should load 8 built-in agents', () => {
         const agents = registry.list();
-        expect(agents.length).toBe(8);
+        expect(agents.length).toBe(9);
     });
 
     it('should get agent by id', () => {
@@ -50,7 +50,7 @@ describe('AgentRegistry', () => {
         });
 
         expect(registry.has('custom-agent')).toBe(true);
-        expect(registry.list().length).toBe(9);
+        expect(registry.list().length).toBe(10);
     });
 
     it('should load custom agents from disk', async () => {
@@ -70,7 +70,7 @@ describe('AgentRegistry', () => {
 
     it('should not initialize twice', async () => {
         await registry.initialize();
-        expect(registry.list().length).toBe(8);
+        expect(registry.list().length).toBe(9);
     });
 
     it('should have all expected built-in agent ids', () => {
@@ -83,6 +83,7 @@ describe('AgentRegistry', () => {
         expect(ids).toContain('distributed-systems-architect');
         expect(ids).toContain('technical-writer');
         expect(ids).toContain('ux-design-strategist');
+        expect(ids).toContain('output-consolidator');
     });
 
     it('should have system prompts for all agents', () => {

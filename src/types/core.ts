@@ -13,6 +13,8 @@ export type WorkflowType = 'BUILD' | 'REVIEW' | 'OPTIMIZE' | 'DESIGN' | 'DEBUG' 
 export type WorkflowStatus = 'PENDING' | 'RUNNING' | 'PAUSED' | 'COMPLETE' | 'FAILED' | 'CANCELLED';
 export type PhaseStatus = 'PENDING' | 'RUNNING' | 'PASS' | 'ITERATE' | 'FAIL' | 'SKIPPED';
 
+export type PhaseMode = 'interactive' | 'non-interactive';
+
 export interface WorkflowPhase {
     id: PhaseId;
     name: string;
@@ -26,6 +28,9 @@ export interface WorkflowPhase {
     startedAt: Date | null;
     completedAt: Date | null;
     output: PhaseOutput | null;
+    lastFeedback: string[];
+    forcePromoted: boolean;
+    mode: PhaseMode;
 }
 
 export interface PhaseOutput {
@@ -33,6 +38,7 @@ export interface PhaseOutput {
     filesModified: string[];
     errors: string[];
     warnings: string[];
+    consolidatedOutput?: string;
 }
 
 export interface AgentOutput {
@@ -120,7 +126,7 @@ export type AsyncResult<T, E = Error> = Promise<Result<T, E>>;
 // AGENT DISPATCH TYPES
 // ============================================================================
 
-export type DispatchMode = 'manual' | 'cli';
+export type DispatchMode = 'manual' | 'cli' | 'terminal';
 
 export interface AgentDefinition {
     id: AgentId;
@@ -142,6 +148,7 @@ export interface AgentContext {
         iteration: number;
         maxIterations: number;
         feedback: string[];
+        mode: PhaseMode;
     };
     previousPhases: PreviousPhaseInfo[];
     peerOutputs: Record<AgentId, string>;
@@ -155,6 +162,7 @@ export interface PreviousPhaseInfo {
     status: PhaseStatus;
     score: number | null;
     agentOutputs: Record<AgentId, string>;
+    filesModified: string[];
 }
 
 export interface DispatchResult {
@@ -175,6 +183,7 @@ export interface CustomWorkflowTemplate {
         description?: string;
         agents: AgentId[];
         maxIterations?: number;
+        mode?: PhaseMode;
     }>;
 }
 
@@ -192,4 +201,36 @@ export interface PhaseDispatchResult {
     mode: DispatchMode;
     results: DispatchResult[];
     prompts?: ManualDispatchPrompt[];
+    terminalSession?: TerminalSession;
+}
+
+// ============================================================================
+// TERMINAL DISPATCH TYPES
+// ============================================================================
+
+export interface AgentTerminalInfo {
+    agentId: AgentId;
+    agentName: string;
+    scriptPath: string;
+    outputPath: string;
+    donePath: string;
+    transcriptPath?: string;
+    pid?: number;
+}
+
+export interface TerminalSession {
+    sessionId: string;
+    sessionDir: string;
+    agents: AgentTerminalInfo[];
+    startedAt: Date;
+    interactive?: boolean;
+}
+
+export interface TerminalSessionStatus {
+    sessionId: string;
+    completed: AgentId[];
+    running: AgentId[];
+    total: number;
+    allDone: boolean;
+    agentDetails: Record<AgentId, { status: 'running' | 'success' | 'failed'; duration?: number }>;
 }

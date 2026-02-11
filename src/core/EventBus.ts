@@ -50,6 +50,10 @@ export interface OrchestratorEvents {
     'agent:phaseDispatchStarted': { workflowId: WorkflowId; phaseId: PhaseId; agents: AgentId[]; mode: DispatchMode };
     'agent:dispatched': { workflowId: WorkflowId; phaseId: PhaseId; agentId: AgentId; result: DispatchResult };
     'agent:phaseDispatchCompleted': { workflowId: WorkflowId; phaseId: PhaseId; agentCount: number; mode: DispatchMode };
+
+    'agent:terminalSpawned': { workflowId: WorkflowId; phaseId: PhaseId; agents: AgentId[]; sessionDir: string };
+    'agent:terminalAgentDone': { workflowId: WorkflowId; phaseId: PhaseId; agentId: AgentId; duration: number; status: 'success' | 'failed' };
+    'agent:terminalAllDone': { workflowId: WorkflowId; phaseId: PhaseId; agentCount: number };
 }
 
 export type EventName = keyof OrchestratorEvents;

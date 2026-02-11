@@ -1,0 +1,27 @@
+{
+  "name": "test-interactive-codegen",
+  "description": "Test E2E du mode interactif: analyse (non-interactive) → code (interactive) → tests (interactive). Vérifie la création de fichiers réels, le git diff tracking, et la consolidation.",
+  "phases": [
+    {
+      "name": "Design",
+      "description": "Analyze the task requirements and produce a detailed technical design. List the files to create, the data structures, and the function signatures. Do NOT create any files — output text only.",
+      "agents": ["fullstack-ui-architect"],
+      "maxIterations": 1,
+      "mode": "non-interactive"
+    },
+    {
+      "name": "Code",
+      "description": "Implement the code based on the Design phase output. Create all necessary source files on disk. Follow TypeScript conventions, add JSDoc comments, and ensure the code compiles.",
+      "agents": ["fullstack-ui-architect"],
+      "maxIterations": 2,
+      "mode": "interactive"
+    },
+    {
+      "name": "Tests",
+      "description": "Write comprehensive unit tests for the code created in the Code phase. Use vitest. Create test files on disk and run them to verify they pass.",
+      "agents": ["test-automation-strategist"],
+      "maxIterations": 2,
+      "mode": "interactive"
+    }
+  ]
+}

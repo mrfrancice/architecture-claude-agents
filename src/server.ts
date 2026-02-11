@@ -20,7 +20,13 @@ import { rollbackTool } from './tools/rollback.tool.js';
 import { memoryTool } from './tools/memory.tool.js';
 import { statusTool } from './tools/status.tool.js';
 import { agentsTool } from './tools/agents.tool.js';
+import { healthTool } from './tools/health.tool.js';
 import type { DispatchMode } from './types/core.js';
+import { createRequire } from 'node:module';
+
+const require = createRequire(import.meta.url);
+const { version: PACKAGE_VERSION } = require('../package.json') as { version: string };
+const SERVER_START_TIME = Date.now();
 
 // ============================================================================
 // TOOLS REGISTRY
@@ -34,6 +40,7 @@ const TOOLS: Tool[] = [
     memoryTool,
     statusTool,
     agentsTool,
+    healthTool,
 ];
 
 const VALID_WORKFLOW_TYPES = new Set(['BUILD', 'REVIEW', 'OPTIMIZE', 'DESIGN', 'DEBUG', 'SECURITY_AUDIT', 'CUSTOM']);
@@ -122,10 +129,22 @@ const TOOL_HANDLERS: Record<string, ToolHandler> = {
         return orch.getSystemStatus();
     },
 
+    'orchestrator_health': async (_args, orch) => {
+        const workflow = await orch.getWorkflowStatus();
+        const activeWorkflows = workflow && workflow.status === 'RUNNING' ? 1 : 0;
+        return {
+            status: 'ok',
+            uptime: Math.floor((Date.now() - SERVER_START_TIME) / 1000),
+            version: PACKAGE_VERSION,
+            activeWorkflows,
+        };
+    },
+
     'orchestrator_agents': async (args, orch) => {
-        const { action, agent_id, mode, name, system_prompt, description, capabilities } = args as {
+        const { action, agent_id, mode, name, system_prompt, description, capabilities, interactive } = args as {
             action: string; agent_id?: string; mode?: string;
             name?: string; system_prompt?: string; description?: string; capabilities?: string[];
+            interactive?: boolean;
         };
         const registry = orch.getAgentRegistry();
 
@@ -152,14 +171,21 @@ const TOOL_HANDLERS: Record<string, ToolHandler> = {
 
             case 'set_mode':
                 if (!mode) throw new Error('Parameter "mode" is required for action "set_mode"');
-                if (mode !== 'manual' && mode !== 'cli') {
-                    throw new Error(`Invalid mode: "${mode}". Valid modes: manual, cli`);
+                if (mode !== 'manual' && mode !== 'cli' && mode !== 'terminal') {
+                    throw new Error(`Invalid mode: "${mode}". Valid modes: manual, cli, terminal`);
                 }
                 orch.setDispatchMode(mode as DispatchMode);
                 return { mode: orch.getDispatchMode() };
 
             case 'get_mode':
                 return { mode: orch.getDispatchMode() };
+
+            case 'set_interactive':
+                orch.setTerminalInteractive(interactive === true);
+                return { interactive: orch.getTerminalInteractive() };
+
+            case 'get_interactive':
+                return { interactive: orch.getTerminalInteractive() };
 
             case 'get_prompt': {
                 if (!agent_id) throw new Error('Parameter "agent_id" is required for action "get_prompt"');
@@ -192,8 +218,14 @@ const TOOL_HANDLERS: Record<string, ToolHandler> = {
                 return { registered: agent_id, total: registry.list().length };
             }
 
+            case 'terminal_status':
+                return orch.getTerminalStatus();
+
+            case 'terminal_collect':
+                return orch.collectTerminalResults();
+
             default:
-                throw new Error(`Unknown action: "${action}". Valid actions: list, get, dispatch, auto_dispatch, set_mode, get_mode, get_prompt, current_phase, register`);
+                throw new Error(`Unknown action: "${action}". Valid actions: list, get, dispatch, auto_dispatch, set_mode, get_mode, set_interactive, get_interactive, get_prompt, current_phase, register, terminal_status, terminal_collect`);
         }
     },
 };

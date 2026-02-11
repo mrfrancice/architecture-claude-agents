@@ -61,15 +61,24 @@ export class ScoringEngine {
             };
         }
 
+        // Extraire le texte combiné des outputs d'agents pour analyse
+        const outputText = this.extractOutputText(output);
+
+        // Si aucun fichier fourni, tenter d'en extraire depuis l'output
+        if (files.length === 0 && outputText) {
+            const extracted = this.extractFilePaths(outputText);
+            files = extracted;
+        }
+
         // Calculer les scores par axe
         const [correctness, completeness, security, bestPractices, tests, documentation] =
             await Promise.all([
-                this.scoreCorrectness(files),
-                this.scoreCompleteness(output, files),
-                this.scoreSecurity(files),
-                this.scoreBestPractices(files),
-                this.scoreTests(),
-                this.scoreDocumentation(files),
+                this.scoreCorrectness(files, outputText),
+                this.scoreCompleteness(output, files, outputText),
+                this.scoreSecurity(files, outputText),
+                this.scoreBestPractices(files, outputText),
+                this.scoreTests(outputText),
+                this.scoreDocumentation(files, outputText),
             ]);
 
         const breakdown: ScoreBreakdown = {
@@ -159,6 +168,31 @@ export class ScoringEngine {
             }
         }
 
+        // Scan agent output text for strong blocker signals
+        if (output) {
+            const agentText = this.extractOutputText(output);
+            if (agentText) {
+                if (/(?:^|\n).*syntax\s*error/im.test(agentText) && !blockers.some(b => b.type === 'SYNTAX_ERROR')) {
+                    blockers.push({
+                        type: 'SYNTAX_ERROR',
+                        message: 'Syntax error detected in agent output',
+                    });
+                }
+                if (/(?:^|\n).*build[:\s]*(failed|failure)/im.test(agentText) && !blockers.some(b => b.type === 'BUILD_FAILED')) {
+                    blockers.push({
+                        type: 'BUILD_FAILED',
+                        message: 'Build failure detected in agent output',
+                    });
+                }
+                if (/(?:^|\n).*(segfault|tests?\s+crashed|fatal\s+error)/im.test(agentText) && !blockers.some(b => b.type === 'TESTS_CRASHED')) {
+                    blockers.push({
+                        type: 'TESTS_CRASHED',
+                        message: 'Tests crashed or fatal error detected in agent output',
+                    });
+                }
+            }
+        }
+
         // CRITICAL_SECURITY - scanner les fichiers pour des failles critiques
         const criticalPatterns: Array<{ pattern: RegExp; name: string }> = [
             { pattern: /password\s*[:=]\s*['"][^'"]+['"]/gi, name: 'Hardcoded password' },
@@ -198,7 +232,7 @@ export class ScoringEngine {
     /**
      * Correctness (25%) - Le code compile et fonctionne
      */
-    private async scoreCorrectness(files: string[]): Promise<number> {
+    private async scoreCorrectness(files: string[], outputText?: string): Promise<number> {
         let score = 70; // Base score
 
         // Vérifier si TypeScript compile
@@ -211,14 +245,17 @@ export class ScoringEngine {
                 const errorCount = compiles.errorCount;
                 score = Math.max(20, 80 - errorCount * 5);
             }
-        } else {
+        } else if (files.length > 0) {
             // Vérifier que les fichiers existent
             let existingFiles = 0;
             for (const file of files) {
                 const fullPath = join(this.projectRoot, file);
                 if (existsSync(fullPath)) existingFiles++;
             }
-            score = files.length > 0 ? Math.round((existingFiles / files.length) * 100) : 70;
+            score = Math.round((existingFiles / files.length) * 100);
+        } else if (outputText) {
+            // Analyser le texte de l'output pour des signaux de correctness
+            score = this.analyzeCorrectnessFromText(outputText);
         }
 
         return Math.max(0, Math.min(100, score));
@@ -227,7 +264,7 @@ export class ScoringEngine {
     /**
      * Completeness (20%) - Requirements couverts
      */
-    private async scoreCompleteness(output: PhaseOutput | null, files: string[]): Promise<number> {
+    private async scoreCompleteness(output: PhaseOutput | null, files: string[], outputText?: string): Promise<number> {
         let score = 70;
 
         if (output) {
@@ -240,6 +277,9 @@ export class ScoringEngine {
                 score = 95;
             } else if (hasOutputs && hasFiles) {
                 score = 80;
+            } else if (hasOutputs && outputText) {
+                // Output exists but no files - analyze text for completeness
+                score = this.analyzeCompletenessFromText(outputText);
             } else if (hasOutputs || hasFiles) {
                 score = 65;
             } else {
@@ -259,7 +299,9 @@ export class ScoringEngine {
                     // Fichier n'existe pas
                 }
             }
-            score = files.length > 0 ? Math.round((nonEmptyCount / files.length) * 100) : 50;
+            score = Math.round((nonEmptyCount / files.length) * 100);
+        } else if (outputText) {
+            score = this.analyzeCompletenessFromText(outputText);
         }
 
         return Math.max(0, Math.min(100, score));
@@ -268,7 +310,7 @@ export class ScoringEngine {
     /**
      * Security (20%) - Patterns de vulnérabilité OWASP
      */
-    private async scoreSecurity(files: string[]): Promise<number> {
+    private async scoreSecurity(files: string[], outputText?: string): Promise<number> {
         let score = 100;
         const issues: string[] = [];
 
@@ -304,13 +346,30 @@ export class ScoringEngine {
             }
         }
 
+        // Analyse additionnelle du texte d'output pour des signaux de sécurité
+        if (files.length === 0 && outputText) {
+            const textSecurityPatterns: Array<{ pattern: RegExp; severity: number }> = [
+                { pattern: /eval\s*\(/g, severity: 10 },
+                { pattern: /innerHTML\s*=/g, severity: 8 },
+                { pattern: /password\s*[:=]\s*['"][^'"]+['"]/gi, severity: 15 },
+                { pattern: /api[_-]?key\s*[:=]\s*['"][^'"]+['"]/gi, severity: 15 },
+                { pattern: /exec\s*\(\s*[`'"]/g, severity: 10 },
+            ];
+            for (const { pattern, severity } of textSecurityPatterns) {
+                if (pattern.test(outputText)) {
+                    score -= severity;
+                    pattern.lastIndex = 0;
+                }
+            }
+        }
+
         return Math.max(0, Math.min(100, score));
     }
 
     /**
      * Best Practices (15%) - Lint et conventions
      */
-    private async scoreBestPractices(files: string[]): Promise<number> {
+    private async scoreBestPractices(files: string[], outputText?: string): Promise<number> {
         // Essayer de lancer le linter
         if (this.tools.linter === 'eslint') {
             const lintResult = await this.runEslint(files);
@@ -340,18 +399,30 @@ export class ScoringEngine {
             }
         }
 
-        score = Math.max(30, score - issues * 2);
+        // Analyse du texte output si pas de fichiers
+        if (files.length === 0 && outputText) {
+            score = this.analyzeBestPracticesFromText(outputText);
+        } else {
+            score = Math.max(30, score - issues * 2);
+        }
+
         return Math.min(100, score);
     }
 
     /**
      * Tests (15%) - Coverage et pass rate
      */
-    private async scoreTests(): Promise<number> {
+    private async scoreTests(outputText?: string): Promise<number> {
         if (!this.tools.testRunner) {
             // Pas de test runner détecté, vérifier s'il y a des fichiers de test
             const hasTestFiles = await this.hasTestFiles();
-            return hasTestFiles ? 50 : 30;
+            if (hasTestFiles) return 50;
+
+            // Analyser l'output pour des mentions de tests
+            if (outputText) {
+                return this.analyzeTestsFromText(outputText);
+            }
+            return 30;
         }
 
         const testResult = await this.runTests();
@@ -363,7 +434,7 @@ export class ScoringEngine {
     /**
      * Documentation (5%) - Présence de docs
      */
-    private async scoreDocumentation(files: string[]): Promise<number> {
+    private async scoreDocumentation(files: string[], outputText?: string): Promise<number> {
         let score = 50;
 
         // README existe ?
@@ -395,6 +466,14 @@ export class ScoringEngine {
         if (totalFiles > 0) {
             const docRatio = filesWithDocs / totalFiles;
             score += Math.round(docRatio * 30);
+        } else if (outputText) {
+            // Analyser l'output pour des mentions de documentation
+            const hasJsDoc = /\/\*\*[\s\S]*?\*\//.test(outputText);
+            const hasComments = /\/\/\s+\w/.test(outputText);
+            const hasReadmeMention = /readme|documentation|jsdoc|tsdoc/i.test(outputText);
+            if (hasJsDoc) score += 15;
+            if (hasComments) score += 10;
+            if (hasReadmeMention) score += 5;
         }
 
         return Math.max(0, Math.min(100, score));
@@ -584,6 +663,176 @@ export class ScoringEngine {
     // ========================================================================
     // HELPERS
     // ========================================================================
+
+    // ========================================================================
+    // OUTPUT TEXT ANALYSIS
+    // ========================================================================
+
+    /**
+     * Extrait le texte combiné de tous les outputs d'agents
+     */
+    private extractOutputText(output: PhaseOutput | null): string {
+        if (!output) return '';
+        const parts: string[] = [];
+        for (const agentOutput of Object.values(output.agentOutputs)) {
+            if (agentOutput.output) {
+                parts.push(agentOutput.output);
+            }
+        }
+        return parts.join('\n');
+    }
+
+    /**
+     * Extrait les chemins de fichiers mentionnés dans l'output
+     */
+    private extractFilePaths(text: string): string[] {
+        const paths = new Set<string>();
+        // Match file paths like src/foo/bar.ts, ./file.js, etc.
+        const filePatterns = [
+            /(?:^|\s|`)((?:src|lib|app|test|tests|__tests__)\/[\w./-]+\.\w{1,5})(?:\s|`|$|:|\))/gm,
+            /(?:^|\s|`)(\.\/[\w./-]+\.\w{1,5})(?:\s|`|$|:|\))/gm,
+            /(?:created?|modified?|updated?|edited?|wrote)\s+(?:`)?([^\s`]+\.\w{1,5})(?:`)?/gi,
+        ];
+        for (const pattern of filePatterns) {
+            let match;
+            while ((match = pattern.exec(text)) !== null) {
+                const filePath = match[1].replace(/^\.\//, '');
+                if (!filePath.includes('..') && !filePath.startsWith('/')) {
+                    paths.add(filePath);
+                }
+            }
+        }
+        return [...paths];
+    }
+
+    /**
+     * Analyse le texte pour des signaux de correctness
+     */
+    private analyzeCorrectnessFromText(text: string): number {
+        let score = 60; // Base plus basse que le default quand on analyse du texte
+        const hasCodeBlocks = /```[\s\S]*?```/.test(text);
+        // Match errors but exclude negated forms like "no errors", "0 errors"
+        const hasErrorMentions = /(?<!no\s)(?<!0\s)(?<!zero\s)\b(error|exception|failed|crash)\b/i.test(text);
+        const hasSuccessSignals = /compil|build\s+success|no\s+errors|0\s+errors|passes|all\s+pass/i.test(text);
+        const hasImplementation = /function|class|interface|export|import|const|let|var/i.test(text);
+
+        if (hasCodeBlocks) score += 15;
+        if (hasImplementation) score += 10;
+        if (hasSuccessSignals) score += 15;
+        if (hasErrorMentions) score -= 10;
+
+        // Strong failure signals — penalize heavily
+        if (/build[:\s]*(failed|failure|error)/i.test(text)) score -= 30;
+        if (/compilation[:\s]*(failed|error)/i.test(text)) score -= 30;
+        if (/syntax\s*error/i.test(text)) score -= 25;
+
+        // Type errors: extract count, -10 per error (cap -40)
+        const typeErrorMatch = text.match(/(\d+)\s+type\s+error/i);
+        if (typeErrorMatch) {
+            const count = parseInt(typeErrorMatch[1], 10);
+            score -= Math.min(40, count * 10);
+        }
+
+        // Generic error count: -5 per error (cap -30)
+        const errorCountMatch = text.match(/(\d+)\s+(error|errors)\b/i);
+        if (errorCountMatch) {
+            const count = parseInt(errorCountMatch[1], 10);
+            if (count > 0) {
+                score -= Math.min(30, count * 5);
+            }
+        }
+
+        return Math.max(0, Math.min(100, score));
+    }
+
+    /**
+     * Analyse le texte pour des signaux de completeness
+     */
+    private analyzeCompletenessFromText(text: string): number {
+        let score = 50;
+        const textLength = text.length;
+
+        // Longueur de l'output comme indicateur de completeness
+        if (textLength > 5000) score += 20;
+        else if (textLength > 2000) score += 15;
+        else if (textLength > 500) score += 10;
+
+        // Signaux structurels
+        if (/```[\s\S]*?```/.test(text)) score += 10;
+        if (/## |### |\*\*/.test(text)) score += 5;
+        if (/step\s+\d|phase\s+\d|\d\.\s/i.test(text)) score += 5;
+
+        return Math.max(20, Math.min(100, score));
+    }
+
+    /**
+     * Analyse le texte pour des signaux de best practices
+     */
+    private analyzeBestPracticesFromText(text: string): number {
+        let score = 70;
+        const codeBlocks = text.match(/```[\s\S]*?```/g) || [];
+
+        for (const block of codeBlocks) {
+            if (/console\.(log|warn|error)/.test(block)) score -= 3;
+            if (/TODO|FIXME|HACK|XXX/i.test(block)) score -= 3;
+            if (/\bany\b/.test(block)) score -= 2;
+            // Positive signals
+            if (/type\s+\w+|interface\s+\w+/.test(block)) score += 3;
+            if (/try\s*\{[\s\S]*?catch/.test(block)) score += 2;
+        }
+
+        return Math.max(30, Math.min(100, score));
+    }
+
+    /**
+     * Analyse le texte pour des signaux de tests
+     */
+    private analyzeTestsFromText(text: string): number {
+        // 1. Try to extract explicit coverage percentage
+        const coverageMatch = text.match(/coverage[:\s]+(\d+)%/i);
+        const coverageScore = coverageMatch ? parseInt(coverageMatch[1], 10) : null;
+
+        // 2. Try to extract pass/fail ratio
+        const failMatch = text.match(/(\d+)\s+fail/i);
+        const passMatch = text.match(/(\d+)\s+pass/i);
+        let ratioScore: number | null = null;
+        if (passMatch || failMatch) {
+            const passed = passMatch ? parseInt(passMatch[1], 10) : 0;
+            const failed = failMatch ? parseInt(failMatch[1], 10) : 0;
+            const total = passed + failed;
+            if (total > 0) {
+                ratioScore = Math.round((passed / total) * 100);
+            }
+        }
+
+        // 3. "no tests" or coverage 0% → very low score
+        if (/no\s+tests|0\s*%\s*coverage|coverage[:\s]+0%/i.test(text)) {
+            return 10;
+        }
+
+        // 4. If we found numeric metrics, use them
+        if (coverageScore !== null && ratioScore !== null) {
+            return Math.max(10, Math.min(100, Math.min(coverageScore, ratioScore)));
+        }
+        if (coverageScore !== null) {
+            return Math.max(10, Math.min(100, coverageScore));
+        }
+        if (ratioScore !== null) {
+            return Math.max(10, Math.min(100, ratioScore));
+        }
+
+        // 5. Fallback: keyword-based analysis
+        let score = 30;
+        const hasTestCode = /describe\s*\(|it\s*\(|test\s*\(|expect\s*\(|assert/i.test(text);
+        const hasTestMention = /test|spec|coverage|unit\s+test|integration\s+test/i.test(text);
+        const hasTestFile = /\.test\.|\.spec\.|__tests__/i.test(text);
+
+        if (hasTestCode) score += 30;
+        if (hasTestMention) score += 10;
+        if (hasTestFile) score += 10;
+
+        return Math.max(20, Math.min(100, score));
+    }
 
     private zeroBreakdown(): ScoreBreakdown {
         return {

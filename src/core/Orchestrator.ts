@@ -8,13 +8,18 @@
  *   MemoryManager, SnapshotManager, ScoringEngine
  */
 
+import { execFile, spawn } from 'node:child_process';
+import { promisify } from 'node:util';
 import { readdir, readFile } from 'node:fs/promises';
 import { join } from 'node:path';
+
+const execFileAsync = promisify(execFile);
 import type {
     Workflow,
     WorkflowType,
     WorkflowPhase,
     PhaseOutput,
+    PhaseMode,
     Result,
     ScoreResult,
     DispatchMode,
@@ -22,12 +27,15 @@ import type {
     ManualDispatchPrompt,
     CustomWorkflowTemplate,
     AgentDefinition,
+    AgentId,
+    AgentOutput,
+    TerminalSessionStatus,
 } from '../types/core.js';
 import { EventBus, getEventBus } from './EventBus.js';
 import { StateManager, type OrchestratorStats } from './StateManager.js';
 import { ConfigLoader, type ProjectConfig } from './ConfigLoader.js';
 import { MemoryManager } from './MemoryManager.js';
-import { SnapshotManager } from './SnapshotManager.js';
+import { SnapshotManager, type FileBaseline } from './SnapshotManager.js';
 import { ScoringEngine } from './ScoringEngine.js';
 import { HookEngine } from './HookEngine.js';
 import { AgentRegistry, getAgentRegistry } from './AgentRegistry.js';
@@ -98,8 +106,10 @@ export class Orchestrator {
     private agentRegistry: AgentRegistry;
     private agentDispatcher: AgentDispatcher | null = null;
     private dispatchMode: DispatchMode = 'manual';
+    private terminalInteractive = false;
     private lastDispatchResult: PhaseDispatchResult | null = null;
     private customWorkflows = new Map<string, CustomWorkflowTemplate>();
+    private prePhaseBaseline: FileBaseline | null = null;
 
     constructor(projectRoot?: string) {
         this.projectRoot = projectRoot || process.cwd();
@@ -228,13 +238,16 @@ export class Orchestrator {
         this.currentWorkflow = workflow;
 
         // Créer un snapshot initial
-        const snapshot = await this.snapshotManager.createSnapshot(
+        const snapshotResult = await this.snapshotManager.createSnapshot(
             workflowId,
             'initial',
             `Initial state before workflow ${type}: ${task}`,
         );
-        if (snapshot) {
-            this.currentWorkflow.snapshotId = snapshot.id;
+        if (snapshotResult.snapshot) {
+            this.currentWorkflow.snapshotId = snapshotResult.snapshot.id;
+        }
+        if (snapshotResult.warning) {
+            console.error(snapshotResult.warning);
         }
 
         // Démarrer la première phase
@@ -325,6 +338,9 @@ export class Orchestrator {
         // Nettoyer les snapshots
         await this.snapshotManager.cleanupWorkflow(this.currentWorkflow.id);
 
+        // Nettoyer la session terminal
+        await this.cleanupTerminalSession();
+
         await this.persistState();
 
         return { success: true };
@@ -364,11 +380,14 @@ export class Orchestrator {
         }
 
         // Créer un snapshot avant la phase
-        await this.snapshotManager.createSnapshot(
+        const phaseSnapshot = await this.snapshotManager.createSnapshot(
             this.currentWorkflow.id,
             phase.id,
             `Before phase: ${phase.name} (iteration ${phase.iteration + 1})`,
         );
+        if (phaseSnapshot.warning) {
+            console.error(phaseSnapshot.warning);
+        }
 
         phase.status = 'RUNNING';
         phase.startedAt = new Date();
@@ -434,9 +453,13 @@ export class Orchestrator {
                 break;
 
             case 'ITERATE':
+                // Stocker le feedback pour l'injection dans le prochain dispatch
+                phase.lastFeedback = scoreResult.feedback;
+
                 if (phase.iteration >= phase.maxIterations) {
-                    // Max itérations atteintes, on passe quand même
+                    // Max itérations atteintes, force-promote en PASS
                     phase.status = 'PASS';
+                    phase.forcePromoted = true;
                     phase.completedAt = new Date();
                     await this.eventBus.emit('phase:completed', {
                         workflowId: this.currentWorkflow.id,
@@ -444,6 +467,9 @@ export class Orchestrator {
                         status: 'PASS',
                         score: scoreResult.total,
                     });
+                    console.error(
+                        `Phase "${phase.name}" force-promoted to PASS after ${phase.maxIterations} iterations (score: ${scoreResult.total}/100)`,
+                    );
                     await this.advanceToNextPhase();
                 } else {
                     phase.status = 'ITERATE';
@@ -501,6 +527,14 @@ export class Orchestrator {
     private async completeWorkflow(): Promise<void> {
         if (!this.currentWorkflow) return;
 
+        // Marquer les phases orphelines (RUNNING/PENDING) comme SKIPPED
+        for (const phase of this.currentWorkflow.phases) {
+            if (phase.status === 'RUNNING' || phase.status === 'PENDING') {
+                phase.status = 'SKIPPED';
+                phase.completedAt = new Date();
+            }
+        }
+
         // Calculer le score total
         const phasesWithScores = this.currentWorkflow.phases.filter(p => p.score !== null);
         if (phasesWithScores.length > 0) {
@@ -529,6 +563,9 @@ export class Orchestrator {
 
         // Nettoyer les snapshots
         await this.snapshotManager.cleanupWorkflow(this.currentWorkflow.id);
+
+        // Nettoyer la session terminal
+        await this.cleanupTerminalSession();
     }
 
     /**
@@ -536,6 +573,14 @@ export class Orchestrator {
      */
     private async failWorkflow(reason: string): Promise<void> {
         if (!this.currentWorkflow) return;
+
+        // Marquer les phases orphelines (RUNNING/PENDING) comme SKIPPED
+        for (const phase of this.currentWorkflow.phases) {
+            if (phase.status === 'RUNNING' || phase.status === 'PENDING') {
+                phase.status = 'SKIPPED';
+                phase.completedAt = new Date();
+            }
+        }
 
         const oldStatus = this.currentWorkflow.status;
         this.currentWorkflow.status = 'FAILED';
@@ -554,6 +599,9 @@ export class Orchestrator {
         // Statistiques et historique
         await this.stateManager.updateStats(this.currentWorkflow);
         await this.stateManager.addToHistory(this.currentWorkflow);
+
+        // Nettoyer la session terminal
+        await this.cleanupTerminalSession();
     }
 
     /**
@@ -574,17 +622,36 @@ export class Orchestrator {
     // ========================================================================
 
     /**
-     * Calcule le score pour une phase ou des fichiers
+     * Calcule le score pour une phase ou des fichiers (sans effets de bord)
      */
     async calculateScore(phaseId?: string, files?: string[]): Promise<Result<ScoreResult>> {
         this.ensureInitialized();
 
+        // Cas 1 : scoring de fichiers spécifiques (pur, sans side effects)
         if (files && files.length > 0) {
             const result = await this.getScoringEngine().scoreFiles(files);
             return { success: true, data: result };
         }
 
-        return this.validatePhase(phaseId);
+        // Cas 2 : scoring de la phase courante SANS appliquer la décision
+        if (!this.currentWorkflow) {
+            return { success: false, error: new Error('No workflow running') };
+        }
+
+        const phase = phaseId
+            ? this.currentWorkflow.phases.find(p => p.id === phaseId)
+            : this.currentWorkflow.phases[this.currentWorkflow.currentPhaseIndex];
+
+        if (!phase) {
+            return { success: false, error: new Error('Phase not found') };
+        }
+
+        const phaseOutput = phase.output || null;
+        const phaseFiles = phaseOutput?.filesModified || [];
+        const result = await this.getScoringEngine().score(phaseOutput, phaseFiles);
+
+        // Retourner le score SANS appliquer la décision
+        return { success: true, data: result };
     }
 
     // ========================================================================
@@ -665,12 +732,49 @@ export class Orchestrator {
             return { success: false, error: new Error(`Phase "${phase.name}" is not running (status: ${phase.status})`) };
         }
 
+        // Injecter automatiquement le feedback de l'itération précédente si non fourni
+        const effectiveFeedback = feedback.length > 0 ? feedback : phase.lastFeedback;
+
         const dispatcher = this.getDispatcher();
-        const result = await dispatcher.dispatchPhase(this.currentWorkflow, phase, feedback);
+
+        // Auto-switch interactive mode based on phase mode (only for terminal dispatch)
+        if (this.dispatchMode === 'terminal') {
+            const isInteractive = phase.mode === 'interactive';
+            dispatcher.setInteractive(isInteractive);
+        }
+
+        // Capture file baseline BEFORE dispatch (for interactive phases)
+        if (phase.mode === 'interactive') {
+            this.prePhaseBaseline = await this.snapshotManager.captureFileBaseline();
+        } else {
+            this.prePhaseBaseline = null;
+        }
+
+        const result = await dispatcher.dispatchPhase(this.currentWorkflow, phase, effectiveFeedback);
 
         // En mode CLI, appliquer les outputs automatiquement
         if (this.dispatchMode === 'cli') {
-            phase.output = AgentDispatcher.toPhaseOutput(result);
+            const phaseOutput = AgentDispatcher.toPhaseOutput(result);
+
+            // Detect files changed via git diff (for interactive phases, delta only)
+            if (phase.mode === 'interactive') {
+                const changedFiles = await this.snapshotManager.getChangedFiles(undefined, this.prePhaseBaseline ?? undefined);
+                phaseOutput.filesModified = [...changedFiles.created, ...changedFiles.modified];
+                for (const agentOut of Object.values(phaseOutput.agentOutputs)) {
+                    agentOut.filesCreated = changedFiles.created;
+                    agentOut.filesModified = changedFiles.modified;
+                }
+            }
+
+            // Consolidate multi-agent outputs if 2+ agents
+            if (Object.keys(phaseOutput.agentOutputs).length >= 2) {
+                const consolidated = await this.consolidatePhaseOutput(phaseOutput);
+                if (consolidated) {
+                    phaseOutput.consolidatedOutput = consolidated;
+                }
+            }
+
+            phase.output = phaseOutput;
         }
 
         this.lastDispatchResult = result;
@@ -683,7 +787,7 @@ export class Orchestrator {
      * Auto-dispatch : dispatch les agents puis auto-validate en mode CLI.
      * En mode manual, retourne les prompts sans valider.
      */
-    async autoDispatchPhase(feedback: string[] = []): Promise<Result<PhaseDispatchResult & { autoValidated?: boolean; score?: ScoreResult }>> {
+    async autoDispatchPhase(feedback: string[] = []): Promise<Result<PhaseDispatchResult & { autoValidated?: boolean; score?: ScoreResult; timedOut?: boolean; terminalStatus?: TerminalSessionStatus }>> {
         const dispatchResult = await this.dispatchPhase(feedback);
         if (!dispatchResult.success || !dispatchResult.data) {
             return dispatchResult;
@@ -698,6 +802,37 @@ export class Orchestrator {
                     ...dispatchResult.data,
                     autoValidated: true,
                     score: validateResult.data,
+                },
+            };
+        }
+
+        // En mode terminal, poll les .done files puis auto-valider
+        if (this.dispatchMode === 'terminal') {
+            const terminalStatus = await this.pollTerminalCompletion();
+
+            if (terminalStatus?.allDone) {
+                const collectResult = await this.collectTerminalResults();
+                if (collectResult.success) {
+                    const validateResult = await this.validatePhase();
+                    return {
+                        success: true,
+                        data: {
+                            ...dispatchResult.data,
+                            autoValidated: true,
+                            score: validateResult.data,
+                        },
+                    };
+                }
+            }
+
+            // Timeout or partial completion
+            return {
+                success: true,
+                data: {
+                    ...dispatchResult.data,
+                    autoValidated: false,
+                    timedOut: !terminalStatus?.allDone,
+                    terminalStatus: terminalStatus ?? undefined,
                 },
             };
         }
@@ -726,6 +861,9 @@ export class Orchestrator {
             return { success: false, error: new Error('No current phase') };
         }
 
+        // Injecter automatiquement le feedback de l'itération précédente si non fourni
+        const effectiveFeedback = feedback.length > 0 ? feedback : phase.lastFeedback;
+
         const dispatcher = this.getDispatcher();
         const prompts: ManualDispatchPrompt[] = [];
 
@@ -734,12 +872,197 @@ export class Orchestrator {
                 agentId,
                 this.currentWorkflow,
                 phase,
-                feedback,
+                effectiveFeedback,
             );
             prompts.push(prompt);
         }
 
         return { success: true, data: prompts };
+    }
+
+    /**
+     * Retourne le statut de la session terminal en cours
+     */
+    async getTerminalStatus(): Promise<Result<TerminalSessionStatus>> {
+        this.ensureInitialized();
+        const dispatcher = this.getDispatcher();
+        const status = await dispatcher.getTerminalStatus();
+        if (!status) {
+            return { success: false, error: new Error('No terminal session active') };
+        }
+        return { success: true, data: status };
+    }
+
+    /**
+     * Collecte les outputs de la session terminal et les injecte dans le PhaseOutput
+     */
+    async collectTerminalResults(): Promise<Result<PhaseOutput>> {
+        this.ensureInitialized();
+
+        if (!this.currentWorkflow) {
+            return { success: false, error: new Error('No workflow running') };
+        }
+
+        const dispatcher = this.getDispatcher();
+        const status = await dispatcher.getTerminalStatus();
+        if (!status) {
+            return { success: false, error: new Error('No terminal session active') };
+        }
+
+        if (!status.allDone) {
+            return {
+                success: false,
+                error: new Error(`Not all agents are done. Running: ${status.running.join(', ')}`),
+            };
+        }
+
+        const outputs = await dispatcher.collectTerminalOutputs();
+        if (!outputs) {
+            return { success: false, error: new Error('Failed to collect terminal outputs') };
+        }
+
+        // Construire le PhaseOutput a partir des outputs terminaux
+        const agentOutputs: Record<AgentId, AgentOutput> = {};
+        const errors: string[] = [];
+
+        for (const [agentId, output] of Object.entries(outputs)) {
+            const detail = status.agentDetails[agentId];
+            const isSuccess = detail?.status === 'success';
+
+            agentOutputs[agentId] = {
+                agentId,
+                status: isSuccess ? 'SUCCESS' : 'FAILED',
+                output,
+                filesCreated: [],
+                filesModified: [],
+                duration: detail?.duration || 0,
+                score: null,
+            };
+
+            if (!isSuccess) {
+                errors.push(`Agent ${agentId}: terminal execution failed`);
+            }
+        }
+
+        const warnings: string[] = [];
+        for (const [agentId, agentOut] of Object.entries(agentOutputs)) {
+            if (agentOut.status === 'SUCCESS' && !agentOut.output.trim()) {
+                warnings.push(`Agent ${agentId}: completed successfully but produced empty output`);
+            }
+        }
+
+        // Detect files changed via git diff (for interactive phases that wrote code)
+        // Use the pre-phase baseline to only get the delta (files created/modified during this phase)
+        const phase = this.currentWorkflow.phases[this.currentWorkflow.currentPhaseIndex];
+        let allFilesModified: string[] = [];
+        let allFilesCreated: string[] = [];
+
+        if (phase?.mode === 'interactive') {
+            const changedFiles = await this.snapshotManager.getChangedFiles(undefined, this.prePhaseBaseline ?? undefined);
+            allFilesModified = [...changedFiles.modified];
+            allFilesCreated = [...changedFiles.created];
+
+            // Populate agent outputs with detected files
+            const agentIds = Object.keys(agentOutputs);
+            if (agentIds.length === 1) {
+                const onlyAgent = agentOutputs[agentIds[0]];
+                onlyAgent.filesCreated = allFilesCreated;
+                onlyAgent.filesModified = allFilesModified;
+            } else {
+                for (const agentOut of Object.values(agentOutputs)) {
+                    agentOut.filesCreated = allFilesCreated;
+                    agentOut.filesModified = allFilesModified;
+                }
+            }
+        }
+
+        const phaseOutput: PhaseOutput = {
+            agentOutputs,
+            filesModified: [...allFilesCreated, ...allFilesModified],
+            errors,
+            warnings,
+        };
+
+        // Consolidate multi-agent outputs if 2+ agents
+        if (Object.keys(agentOutputs).length >= 2) {
+            const consolidated = await this.consolidatePhaseOutput(phaseOutput);
+            if (consolidated) {
+                phaseOutput.consolidatedOutput = consolidated;
+            }
+        }
+
+        // Injecter dans la phase courante
+        if (phase) {
+            phase.output = phaseOutput;
+        }
+
+        await this.persistState();
+
+        return { success: true, data: phaseOutput };
+    }
+
+    /**
+     * Poll la session terminal jusqu'a ce que tous les agents soient termines
+     * ou que le timeout soit atteint (30 minutes).
+     * Emet agent:terminalAgentDone pour chaque nouvelle completion
+     * et agent:terminalAllDone quand tous sont finis.
+     */
+    private async pollTerminalCompletion(): Promise<TerminalSessionStatus | null> {
+        const POLL_INTERVAL = 3000; // 3 seconds
+        const TIMEOUT = 30 * 60 * 1000; // 30 minutes
+        const startTime = Date.now();
+        const completedAgents = new Set<string>();
+
+        const workflow = this.currentWorkflow;
+        if (!workflow) return null;
+
+        const phase = workflow.phases[workflow.currentPhaseIndex];
+        if (!phase) return null;
+
+        while (Date.now() - startTime < TIMEOUT) {
+            // Abort if workflow is no longer running
+            if (workflow.status !== 'RUNNING') {
+                const finalStatus = await this.getTerminalStatus();
+                return finalStatus.data ?? null;
+            }
+
+            const statusResult = await this.getTerminalStatus();
+            if (!statusResult.success || !statusResult.data) {
+                return null;
+            }
+
+            const status = statusResult.data;
+
+            // Emit events for newly completed agents
+            for (const agentId of status.completed) {
+                if (!completedAgents.has(agentId)) {
+                    completedAgents.add(agentId);
+                    const detail = status.agentDetails[agentId];
+                    await this.eventBus.emit('agent:terminalAgentDone', {
+                        workflowId: workflow.id,
+                        phaseId: phase.id,
+                        agentId,
+                        duration: detail?.duration ?? 0,
+                        status: detail?.status === 'failed' ? 'failed' : 'success',
+                    });
+                }
+            }
+
+            if (status.allDone) {
+                await this.eventBus.emit('agent:terminalAllDone', {
+                    workflowId: workflow.id,
+                    phaseId: phase.id,
+                    agentCount: status.total,
+                });
+                return status;
+            }
+
+            await new Promise(resolve => setTimeout(resolve, POLL_INTERVAL));
+        }
+
+        // Timeout: return partial status
+        const finalStatus = await this.getTerminalStatus();
+        return finalStatus.data ?? null;
     }
 
     /**
@@ -757,6 +1080,23 @@ export class Orchestrator {
         if (this.agentDispatcher) {
             this.agentDispatcher.setMode(mode);
         }
+    }
+
+    /**
+     * Active/desactive le mode interactif pour les panes terminal
+     */
+    setTerminalInteractive(val: boolean): void {
+        this.terminalInteractive = val;
+        if (this.agentDispatcher) {
+            this.agentDispatcher.setInteractive(val);
+        }
+    }
+
+    /**
+     * Retourne si le mode interactif est actif
+     */
+    getTerminalInteractive(): boolean {
+        return this.terminalInteractive;
     }
 
     /**
@@ -780,7 +1120,8 @@ export class Orchestrator {
         this.ensureInitialized();
         const workflowId = this.currentWorkflow?.id || 'manual';
         const phaseId = 'manual';
-        return this.snapshotManager.createSnapshot(workflowId, phaseId, description);
+        const result = await this.snapshotManager.createSnapshot(workflowId, phaseId, description);
+        return result;
     }
 
     /**
@@ -833,6 +1174,7 @@ export class Orchestrator {
                         status: p.status,
                         iteration: p.iteration,
                         score: p.score,
+                        forcePromoted: p.forcePromoted || false,
                     })),
                 }
                 : null,
@@ -862,43 +1204,117 @@ export class Orchestrator {
     }
 
     // ========================================================================
+    // OUTPUT CONSOLIDATION
+    // ========================================================================
+
+    /**
+     * Consolide les outputs multi-agents en un rapport structure via l'agent output-consolidator.
+     * Appele uniquement quand 2+ agents ont produit des outputs.
+     * Utilise execFileAsync('claude') directement — meme pattern que AgentDispatcher.dispatchCli.
+     */
+    async consolidatePhaseOutput(phaseOutput: PhaseOutput): Promise<string> {
+        const entries = Object.entries(phaseOutput.agentOutputs);
+        if (entries.length < 2) return '';
+
+        const consolidator = this.agentRegistry.get('output-consolidator');
+        if (!consolidator) return '';
+
+        // Build a prompt with all agent outputs
+        const parts: string[] = ['Consolidate the following agent outputs from a single phase:\n'];
+        for (const [agentId, agentOutput] of entries) {
+            parts.push(`### Agent: ${agentId}`);
+            parts.push(`Status: ${agentOutput.status}`);
+            const truncated = agentOutput.output.length > 5000
+                ? agentOutput.output.slice(0, 5000) + '\n... [truncated]'
+                : agentOutput.output;
+            parts.push(`Output:\n${truncated}\n`);
+        }
+
+        const userPrompt = parts.join('\n');
+
+        try {
+            // Use spawn + stdin to avoid Windows command-line length limit (8191 chars).
+            // The system prompt (~800 chars) fits on the command line; the user prompt
+            // (potentially thousands of chars with full agent outputs) is piped via stdin.
+            const args = ['--print', '--system-prompt', consolidator.systemPrompt];
+            const isWindows = process.platform === 'win32';
+
+            const result = await new Promise<string>((resolve, reject) => {
+                const child = spawn('claude', args, {
+                    shell: isWindows,
+                    stdio: ['pipe', 'pipe', 'pipe'],
+                    windowsHide: true,
+                    timeout: 5 * 60 * 1000,
+                });
+
+                let stdout = '';
+                let stderr = '';
+                child.stdout.on('data', (d: Buffer) => { stdout += d.toString(); });
+                child.stderr.on('data', (d: Buffer) => { stderr += d.toString(); });
+
+                child.on('close', (code: number | null) => {
+                    if (code === 0) resolve(stdout.trim());
+                    else reject(new Error(`claude exited with code ${code}: ${stderr.slice(0, 500)}`));
+                });
+                child.on('error', reject);
+
+                // Write user prompt to stdin — claude --print reads from stdin when no positional arg
+                child.stdin.write(userPrompt);
+                child.stdin.end();
+            });
+
+            return result;
+        } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            console.error('Consolidation failed:', msg);
+            return '';
+        }
+    }
+
+    // ========================================================================
     // PHASE TEMPLATES
     // ========================================================================
 
     private createPhasesForType(type: WorkflowType, workflowId: string): WorkflowPhase[] {
-        const phaseTemplates: Partial<Record<WorkflowType, Array<{ name: string; agents: string[] }>>> = {
+        const REGRESSION_DESCRIPTION = 'Run the entire existing test suite to verify no regressions were introduced. Execute all tests (unit, integration, e2e), report any failures with the failing test name, file, and error message, identify which modified files likely caused each failure, and propose fixes for any broken tests.';
+
+        type PhaseTemplate = { name: string; description?: string; agents: string[]; mode?: PhaseMode };
+
+        const phaseTemplates: Partial<Record<WorkflowType, PhaseTemplate[]>> = {
             BUILD: [
-                { name: 'Design', agents: ['fullstack-ui-architect'] },
-                { name: 'Code', agents: ['fullstack-ui-architect'] },
-                { name: 'Tests', agents: ['test-automation-strategist'] },
-                { name: 'Security', agents: ['security-expert'] },
-                { name: 'Review', agents: ['senior-code-reviewer'] },
+                { name: 'Design', agents: ['fullstack-ui-architect'], mode: 'non-interactive' },
+                { name: 'Code', agents: ['fullstack-ui-architect'], mode: 'interactive' },
+                { name: 'Tests', agents: ['test-automation-strategist'], mode: 'interactive' },
+                { name: 'Regression', description: REGRESSION_DESCRIPTION, agents: ['test-automation-strategist'], mode: 'interactive' },
+                { name: 'Security', agents: ['security-expert'], mode: 'non-interactive' },
+                { name: 'Review', agents: ['senior-code-reviewer'], mode: 'non-interactive' },
             ],
             REVIEW: [
-                { name: 'Analysis', agents: ['senior-code-reviewer'] },
-                { name: 'Security Check', agents: ['security-expert'] },
-                { name: 'Report', agents: ['technical-writer'] },
+                { name: 'Analysis', agents: ['senior-code-reviewer'], mode: 'non-interactive' },
+                { name: 'Security Check', agents: ['security-expert'], mode: 'non-interactive' },
+                { name: 'Report', agents: ['technical-writer'], mode: 'non-interactive' },
             ],
             OPTIMIZE: [
-                { name: 'Profiling', agents: ['database-optimization-expert'] },
-                { name: 'Optimization', agents: ['distributed-systems-architect'] },
-                { name: 'Verification', agents: ['test-automation-strategist'] },
+                { name: 'Profiling', agents: ['database-optimization-expert'], mode: 'non-interactive' },
+                { name: 'Optimization', agents: ['distributed-systems-architect'], mode: 'interactive' },
+                { name: 'Regression', description: REGRESSION_DESCRIPTION, agents: ['test-automation-strategist'], mode: 'interactive' },
             ],
             DESIGN: [
-                { name: 'Requirements', agents: ['ux-design-strategist'] },
-                { name: 'Architecture', agents: ['distributed-systems-architect'] },
-                { name: 'Documentation', agents: ['technical-writer'] },
+                { name: 'Requirements', agents: ['ux-design-strategist'], mode: 'non-interactive' },
+                { name: 'Architecture', agents: ['distributed-systems-architect'], mode: 'non-interactive' },
+                { name: 'Documentation', agents: ['technical-writer'], mode: 'non-interactive' },
             ],
             DEBUG: [
-                { name: 'Investigation', agents: ['senior-code-reviewer'] },
-                { name: 'Fix', agents: ['fullstack-ui-architect'] },
-                { name: 'Verification', agents: ['test-automation-strategist'] },
+                { name: 'Investigation', agents: ['senior-code-reviewer'], mode: 'non-interactive' },
+                { name: 'Fix', agents: ['fullstack-ui-architect'], mode: 'interactive' },
+                { name: 'Regression', description: REGRESSION_DESCRIPTION, agents: ['test-automation-strategist'], mode: 'interactive' },
             ],
             SECURITY_AUDIT: [
-                { name: 'Scan', agents: ['security-expert'] },
-                { name: 'Analysis', agents: ['security-expert'] },
-                { name: 'Remediation', agents: ['security-expert', 'fullstack-ui-architect'] },
-                { name: 'Report', agents: ['technical-writer'] },
+                { name: 'Scan', agents: ['security-expert'], mode: 'non-interactive' },
+                { name: 'Analysis', agents: ['security-expert'], mode: 'non-interactive' },
+                { name: 'Remediation', agents: ['security-expert', 'fullstack-ui-architect'], mode: 'interactive' },
+                { name: 'Regression', description: REGRESSION_DESCRIPTION, agents: ['test-automation-strategist'], mode: 'interactive' },
+                { name: 'Report', agents: ['technical-writer'], mode: 'non-interactive' },
             ],
         };
 
@@ -907,7 +1323,7 @@ export class Orchestrator {
         return templates!.map((template, index) => ({
             id: `${workflowId}_phase_${index}`,
             name: template.name,
-            description: `Phase ${index + 1}: ${template.name}`,
+            description: template.description || `Phase ${index + 1}: ${template.name}`,
             agents: template.agents,
             dependencies: index > 0 ? [`${workflowId}_phase_${index - 1}`] : [],
             status: 'PENDING' as const,
@@ -917,12 +1333,59 @@ export class Orchestrator {
             startedAt: null,
             completedAt: null,
             output: null,
+            lastFeedback: [],
+            forcePromoted: false,
+            mode: template.mode || 'non-interactive',
         }));
     }
 
     // ========================================================================
     // HELPERS
     // ========================================================================
+
+    /**
+     * Valide qu'un objet JSON contient les champs requis pour un workflow template
+     */
+    private validateWorkflowTemplate(data: unknown, filename: string): CustomWorkflowTemplate | null {
+        if (typeof data !== 'object' || data === null) {
+            console.error(`Invalid workflow template in ${filename}: expected a JSON object`);
+            return null;
+        }
+
+        const obj = data as Record<string, unknown>;
+        const errors: string[] = [];
+
+        if (typeof obj.name !== 'string' || obj.name.trim() === '') {
+            errors.push('name (string, non-empty)');
+        }
+
+        if (!Array.isArray(obj.phases) || obj.phases.length === 0) {
+            errors.push('phases (non-empty array)');
+        } else {
+            for (let i = 0; i < obj.phases.length; i++) {
+                const phase = obj.phases[i] as Record<string, unknown> | null;
+                if (typeof phase !== 'object' || phase === null) {
+                    errors.push(`phases[${i}] (must be an object)`);
+                    continue;
+                }
+                if (typeof phase.name !== 'string' || (phase.name as string).trim() === '') {
+                    errors.push(`phases[${i}].name (string, non-empty)`);
+                }
+                if (!Array.isArray(phase.agents) || phase.agents.length === 0) {
+                    errors.push(`phases[${i}].agents (non-empty array of strings)`);
+                } else if (!phase.agents.every((a: unknown) => typeof a === 'string')) {
+                    errors.push(`phases[${i}].agents (all elements must be strings)`);
+                }
+            }
+        }
+
+        if (errors.length > 0) {
+            console.error(`Invalid workflow template in ${filename}: missing or invalid required fields: ${errors.join(', ')}`);
+            return null;
+        }
+
+        return data as CustomWorkflowTemplate;
+    }
 
     private async loadCustomWorkflows(): Promise<void> {
         const workflowsDir = join(this.projectRoot, '.claude', 'orchestrator', 'workflows');
@@ -931,10 +1394,14 @@ export class Orchestrator {
             for (const file of files.filter(f => f.endsWith('.json'))) {
                 try {
                     const content = await readFile(join(workflowsDir, file), 'utf-8');
-                    const tpl = JSON.parse(content) as CustomWorkflowTemplate;
-                    if (tpl.name && tpl.phases?.length > 0) {
-                        this.customWorkflows.set(tpl.name, tpl);
+                    const data: unknown = JSON.parse(content);
+
+                    const tpl = this.validateWorkflowTemplate(data, file);
+                    if (!tpl) {
+                        continue;
                     }
+
+                    this.customWorkflows.set(tpl.name, tpl);
                 } catch (err) {
                     console.error(`Failed to load custom workflow from ${file}:`, err);
                 }
@@ -958,13 +1425,22 @@ export class Orchestrator {
             startedAt: null,
             completedAt: null,
             output: null,
+            lastFeedback: [],
+            forcePromoted: false,
+            mode: phase.mode || 'non-interactive',
         }));
     }
 
     private calculateProgress(): number {
         if (!this.currentWorkflow) return 0;
+
+        // Workflow terminé = 100%
+        if (this.currentWorkflow.status === 'COMPLETE' || this.currentWorkflow.status === 'FAILED') {
+            return 100;
+        }
+
         const completed = this.currentWorkflow.phases.filter(
-            p => p.status === 'PASS' || p.status === 'SKIPPED',
+            p => p.status === 'PASS' || p.status === 'SKIPPED' || p.status === 'FAIL',
         ).length;
         return Math.round((completed / this.currentWorkflow.phases.length) * 100);
     }
@@ -1020,6 +1496,30 @@ export class Orchestrator {
             throw new Error('AgentDispatcher not available. Ensure initialize() completed successfully.');
         }
         return this.agentDispatcher;
+    }
+
+    /**
+     * Nettoie la session terminal si elle existe
+     */
+    private async cleanupTerminalSession(): Promise<void> {
+        const dispatcher = this.agentDispatcher;
+        if (!dispatcher) return;
+
+        const session = dispatcher.getCurrentTerminalSession();
+        if (!session) return;
+
+        // Only delete the session directory if all agents have finished.
+        // If panes are still running, deleting the dir would break their output writes.
+        try {
+            const status = await dispatcher.getTerminalDispatcher().getStatus(session);
+            if (status.allDone) {
+                await dispatcher.getTerminalDispatcher().cleanupSession(session);
+            }
+        } catch (err) {
+            console.error('Failed to cleanup terminal session:', err);
+        }
+
+        dispatcher.resetTerminalSession();
     }
 
     private ensureInitialized(): void {

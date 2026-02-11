@@ -1,0 +1,18 @@
+{
+  "name": "test-2agents",
+  "description": "Workflow de test avec phase multi-agents pour tester consolidation + terminal interactif",
+  "phases": [
+    {
+      "name": "Dual Analysis",
+      "description": "Analyse par 2 agents en parallele: securite + architecture",
+      "agents": ["security-expert", "fullstack-ui-architect"],
+      "maxIterations": 1
+    },
+    {
+      "name": "Report",
+      "description": "Redaction du rapport final",
+      "agents": ["technical-writer"],
+      "maxIterations": 1
+    }
+  ]
+}
