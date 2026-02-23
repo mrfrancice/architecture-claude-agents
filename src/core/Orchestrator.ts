@@ -27,7 +27,9 @@ import { HookEngine } from './HookEngine.js';
 import { ScoringEngine } from './ScoringEngine.js';
 import { AgentDispatcher, extractSummary } from './AgentDispatcher.js';
 import { SkillLoader } from './SkillLoader.js';
-import { logInfo } from '../utils/safe-logger.js';
+import { SnapshotManager } from './SnapshotManager.js';
+import { HookExecutor } from './HookExecutor.js';
+import { logInfo, logWarn } from '../utils/safe-logger.js';
 
 // ============================================================================
 // TYPES
@@ -83,6 +85,8 @@ export class Orchestrator {
     private agentRegistry: AgentRegistry;
     private hookEngine: HookEngine;
     private skillLoader: SkillLoader;
+    private snapshotManager: SnapshotManager;
+    private hookExecutor: HookExecutor;
     private scoringEngine: ScoringEngine | null = null;
     private dispatcher: AgentDispatcher | null = null;
 
@@ -98,6 +102,8 @@ export class Orchestrator {
         this.agentRegistry = new AgentRegistry(this.projectRoot);
         this.hookEngine = new HookEngine(this.projectRoot, this.eventBus);
         this.skillLoader = new SkillLoader(this.projectRoot);
+        this.snapshotManager = new SnapshotManager(this.projectRoot, this.eventBus);
+        this.hookExecutor = new HookExecutor(this.eventBus, this.stateManager);
     }
 
     // ========================================================================
@@ -116,7 +122,11 @@ export class Orchestrator {
             this.agentRegistry.initialize(),
             this.hookEngine.initialize(),
             this.skillLoader.initialize(),
+            this.snapshotManager.initialize(),
         ]);
+
+        // HookExecutor subscribes to events (synchronous, must run after HookEngine init)
+        this.hookExecutor.initialize();
 
         // Load project config (needs filesystem)
         this.projectConfig = await this.configLoader.load();
@@ -129,6 +139,7 @@ export class Orchestrator {
             this.agentRegistry,
             this.memoryManager,
             this.eventBus,
+            this.hookExecutor,
         );
 
         this.initialized = true;
@@ -199,6 +210,17 @@ export class Orchestrator {
         }
 
         await this.stateManager.setWorkflow(workflow);
+
+        // Create initial snapshot (non-fatal)
+        try {
+            await this.snapshotManager.create(
+                workflow.id,
+                workflow.phases[0]?.id || 'initial',
+                `Initial snapshot for workflow ${workflow.type}`,
+            );
+        } catch (err) {
+            logWarn('Failed to create initial snapshot', err);
+        }
 
         this.eventBus.emit('workflow:started', {
             workflowId: workflow.id,
@@ -285,6 +307,9 @@ export class Orchestrator {
             return { success: false, error: new Error('No current phase') };
         }
 
+        // Clear hook results for new phase
+        this.hookExecutor.clearResults();
+
         // Verify dependencies are satisfied
         if (phase.dependencies.length > 0) {
             const unsatisfied = phase.dependencies.filter(depId => {
@@ -297,6 +322,17 @@ export class Orchestrator {
                     error: new Error(`Phase dependencies not satisfied: ${unsatisfied.join(', ')}`),
                 };
             }
+        }
+
+        // Create pre-phase snapshot (non-fatal)
+        try {
+            await this.snapshotManager.create(
+                workflow.id,
+                phase.id,
+                `Pre-phase snapshot: ${phase.name} (iteration ${phase.iteration})`,
+            );
+        } catch (err) {
+            logWarn(`Failed to create pre-phase snapshot for ${phase.name}`, err);
         }
 
         this.eventBus.emit('phase:started', {
@@ -667,18 +703,67 @@ export class Orchestrator {
     }
 
     // ========================================================================
-    // ROLLBACK (stub - SnapshotManager hors scope)
+    // ROLLBACK / SNAPSHOTS
     // ========================================================================
 
     async rollback(action?: string, snapshotId?: string, description?: string): Promise<Result<unknown>> {
+        this.ensureInitialized();
+
         switch (action) {
-            case 'list':
-                return { success: true, data: [] };
-            case 'create':
-                return { success: true, data: { message: 'Snapshot creation not yet implemented' } };
-            case 'restore':
+            case 'list': {
+                const workflow = this.stateManager.getWorkflow();
+                const snapshots = this.snapshotManager.list(workflow?.id);
+                return {
+                    success: true,
+                    data: {
+                        snapshots,
+                        count: snapshots.length,
+                    },
+                };
+            }
+            case 'create': {
+                const workflow = this.stateManager.getWorkflow();
+                const workflowId = workflow?.id || 'manual';
+                const phaseId = workflow?.phases[workflow.currentPhaseIndex]?.id || 'manual';
+                const desc = description || 'Manual snapshot';
+                try {
+                    const snapshot = await this.snapshotManager.create(workflowId, phaseId, desc);
+                    return { success: true, data: snapshot };
+                } catch (err) {
+                    return {
+                        success: false,
+                        error: err instanceof Error ? err : new Error(String(err)),
+                    };
+                }
+            }
+            case 'restore': {
+                if (!snapshotId) {
+                    // Use latest snapshot if no ID provided
+                    const workflow = this.stateManager.getWorkflow();
+                    const snapshots = this.snapshotManager.list(workflow?.id);
+                    if (snapshots.length === 0) {
+                        return { success: false, error: new Error('No snapshots available for restore') };
+                    }
+                    snapshotId = snapshots[snapshots.length - 1].id;
+                }
+                try {
+                    const snapshot = await this.snapshotManager.restore(snapshotId);
+                    return { success: true, data: snapshot };
+                } catch (err) {
+                    return {
+                        success: false,
+                        error: err instanceof Error ? err : new Error(String(err)),
+                    };
+                }
+            }
             default:
-                return { success: true, data: { message: 'Rollback not yet implemented' } };
+                return {
+                    success: true,
+                    data: {
+                        message: 'Use action: "list", "create", or "restore"',
+                        totalSnapshots: this.snapshotManager.count,
+                    },
+                };
         }
     }
 

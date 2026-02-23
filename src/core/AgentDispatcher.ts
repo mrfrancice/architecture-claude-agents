@@ -17,6 +17,7 @@ import type {
 import type { AgentRegistry } from './AgentRegistry.js';
 import type { MemoryManager } from './MemoryManager.js';
 import type { EventBus } from './EventBus.js';
+import type { HookExecutor } from './HookExecutor.js';
 import { logInfo, logDebug, logError, logWarn } from '../utils/safe-logger.js';
 import { truncate } from '../utils/string-helpers.js';
 
@@ -38,10 +39,15 @@ const AGENT_SUMMARY_MAX_LENGTH = 2000;
 // ============================================================================
 
 export class ContextPipeline {
+    private hookExecutor?: HookExecutor;
+
     constructor(
         private registry: AgentRegistry,
         private memoryManager: MemoryManager,
-    ) {}
+        hookExecutor?: HookExecutor,
+    ) {
+        this.hookExecutor = hookExecutor;
+    }
 
     /**
      * Construit le contexte complet pour un agent.
@@ -156,6 +162,14 @@ export class ContextPipeline {
             sections.push('## Collaboration Context\n' + collabLines.join('\n'));
         }
 
+        // Active hook guidance
+        if (this.hookExecutor) {
+            const guidance = this.hookExecutor.formatGuidanceForPrompt();
+            if (guidance) {
+                sections.push('## Active Hook Guidance\n' + guidance);
+            }
+        }
+
         // Project info
         const pi = context.projectInfo;
         sections.push(
@@ -249,8 +263,9 @@ export class AgentDispatcher {
         registry: AgentRegistry,
         memoryManager: MemoryManager,
         eventBus: EventBus,
+        hookExecutor?: HookExecutor,
     ) {
-        this.pipeline = new ContextPipeline(registry, memoryManager);
+        this.pipeline = new ContextPipeline(registry, memoryManager, hookExecutor);
         this.eventBus = eventBus;
     }
 

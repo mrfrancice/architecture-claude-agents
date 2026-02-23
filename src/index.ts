@@ -13,6 +13,8 @@ export { AgentRegistry, getAgentRegistry } from './core/AgentRegistry.js';
 export { ScoringEngine } from './core/ScoringEngine.js';
 export { AgentDispatcher, ContextPipeline, extractSummary } from './core/AgentDispatcher.js';
 export { HookEngine } from './core/HookEngine.js';
+export { SnapshotManager, type Snapshot } from './core/SnapshotManager.js';
+export { HookExecutor, type HookResult } from './core/HookExecutor.js';
 export { SkillLoader } from './core/SkillLoader.js';
 export * from './tools/index.js';
 

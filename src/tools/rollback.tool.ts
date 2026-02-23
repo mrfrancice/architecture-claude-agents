@@ -17,9 +17,18 @@ Si aucun snapshotId n'est fourni, utilise le dernier snapshot valide.`,
     inputSchema: {
         type: 'object',
         properties: {
+            action: {
+                type: 'string',
+                enum: ['list', 'create', 'restore'],
+                description: 'Action à effectuer: list (lister), create (créer), restore (restaurer)',
+            },
             snapshotId: {
                 type: 'string',
-                description: 'ID du snapshot vers lequel rollback (optionnel)',
+                description: 'ID du snapshot vers lequel rollback (requis pour restore)',
+            },
+            description: {
+                type: 'string',
+                description: 'Description du snapshot (optionnel pour create)',
             },
         },
     },
